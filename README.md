@@ -1,8 +1,8 @@
 # Calendar Spread Edge Screener
 
-A desktop GUI that scans a watchlist for calendar spread setups, ranks them by implied forward volatility, and lets you analyse individual trades with a real-time P/L chart.
+A ktinker GUI that scans a watchlist for calendar spread setups, and ranks them by forward factor. Also allows you analyse individual trades with a real-time P/L chart.
 
-**Data sources:** Tastytrade production API (option chains + DXLink 15-min delayed quotes) and yfinance (earnings dates, market cap, dividends).
+**Data sources:** Tastytrade API using DXLINK (option chains + quotes) and yfinance (earnings dates, market cap, dividend dates).
 
 ---
 
@@ -19,7 +19,7 @@ A desktop GUI that scans a watchlist for calendar spread setups, ranks them by i
 
 ```bash
 git clone <repo-url>
-cd calendar-spread
+cd TastyFwdFactor
 ```
 
 ### 2. Install Python dependencies
@@ -49,7 +49,7 @@ sudo dnf install python3-tkinter
 
 ### 3. Prepare a watchlist CSV
 
-The app expects a CSV file with a `TICKER` header in the first column. By default it looks for `full.csv` in the same directory as `main.py`. You can point it at any CSV via **Filters & Scan Settings** in the GUI.
+The app expects a CSV file with a `TICKER` header in the first column. I have included a list of tickers with options traded on the CBOE (around ~5000) called full.csv. By default the script will use these, however feel free to use any list you want, provided it is in the below format:  
 
 Example:
 
@@ -66,9 +66,9 @@ NVDA
 
 The app authenticates with the Tastytrade **production** API using OAuth long-lived tokens — no username/password is stored.
 
-1. Log in to your Tastytrade account and open the **API** section of your account settings (or visit `developer.tastyworks.com`).
+1. Log in to your Tastytrade account and open the **API** section of your account settings (using the web interface).
 2. Create an OAuth application to obtain a **Client Secret**.
-3. Use the OAuth flow to generate a **Refresh Token** for your account.
+3. Create a grant for the OAuth application to obtain a **Refresh Token** for your account, make sure to only give the grant **read** access. 
 
 Both values are entered in the app's sidebar when you launch it. They are saved to the OS keyring (or `~/.config/calendar-spread/credentials.json` if no keyring backend is available) and pre-filled on future launches.
 
