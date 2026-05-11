@@ -49,7 +49,7 @@ sudo dnf install python3-tkinter
 
 ### 3. Prepare a watchlist CSV
 
-The app expects a CSV file with a `TICKER` header in the first column. By default it looks for `../russell_3000.csv` (one level above the `calendar-spread/` directory). You can point it at any CSV via **Filters & Scan Settings** in the GUI.
+The app expects a CSV file with a `TICKER` header in the first column. By default it looks for `full.csv` in the same directory as `main.py`. You can point it at any CSV via **Filters & Scan Settings** in the GUI.
 
 Example:
 
@@ -94,7 +94,7 @@ Open **Filters & Scan Settings…** from the sidebar to configure the following.
 
 | Setting | Default | Description |
 |---|---|---|
-| Watchlist CSV | `../russell_3000.csv` | Path to your ticker list |
+| Watchlist CSV | `full.csv` | Path to your ticker list |
 | Target Front DTE | 21 | Target days-to-expiry for the short leg |
 | Target Back DTE | 45 | Target days-to-expiry for the long leg |
 | DTE flex (± days) | 0 | `0` = pick the nearest available expiry; `>0` = restrict to target ± flex |

@@ -158,7 +158,7 @@ def save_credentials(client_secret, refresh_token):
 _SETTINGS_PATH = Path.home() / ".config" / "calendar-spread" / "settings.json"
 
 DEFAULT_SETTINGS = {
-    'csv_path':              str(Path(__file__).parent.parent / "russell_3000.csv"),
+    'csv_path':              str(Path(__file__).parent / "full.csv"),
     'front_dte':             21,
     'back_dte':              45,
     'front_dte_flex':        0,
