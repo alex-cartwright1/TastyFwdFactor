@@ -1,0 +1,8 @@
+requests
+scipy
+numpy
+websocket-client
+pandas
+yfinance
+matplotlib
+keyring
