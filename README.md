@@ -1,6 +1,8 @@
 # Calendar Spread Edge Screener
 
-A ktinker GUI that scans a watchlist for calendar spread setups, and ranks them by forward factor. Also allows you analyse individual trades with a real-time P/L chart.
+**Website:** [tastyfwdfactor.cch.tech](https://tastyfwdfactor.cch.tech)
+
+A Tkinter GUI that scans a watchlist for calendar spread setups, and ranks them by forward factor. Also allows you to analyse individual trades with a real-time P/L chart, and track open positions with live P/L.
 
 **Data sources:** Tastytrade API using DXLINK (option chains + quotes) and yfinance (earnings dates, market cap, dividend dates).
 
@@ -18,7 +20,7 @@ A ktinker GUI that scans a watchlist for calendar spread setups, and ranks them 
 ### 1. Clone the repo
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/alex-cartwright1/TastyFwdFactor.git
 cd TastyFwdFactor
 ```
 
@@ -176,6 +178,23 @@ Select any row in the results table to populate the **Analyse Selected Trade** p
 
 ---
 
+## Position tracker
+
+The **Positions** tab lets you track open calendar spread positions with live P/L.
+
+### Adding a position
+
+- Click **Add Position** in the Positions tab, or select a row in the scan results and click **Add to Positions** to pre-populate the legs from that scan result.
+- In the dialog, enter the ticker, strike, front and back expiry dates, and the prices you actually paid/received for each leg.
+
+### Live P/L
+
+Once positions are loaded, live quotes stream through the same DXLink connection used by the scanner. P/L is updated in real time as bid/ask prices change, and cells flash on quote updates.
+
+Positions are saved automatically to `~/.config/calendar-spread/positions.json` and restored on the next launch.
+
+---
+
 ## File locations
 
 | Path | Contents |
@@ -183,6 +202,7 @@ Select any row in the results table to populate the **Analyse Selected Trade** p
 | `debug.log` | Full debug log for the current session (overwritten on each launch) |
 | `~/.config/calendar-spread/settings.json` | Scan settings and filters |
 | `~/.config/calendar-spread/ticker_info.json` | Earnings / market cap / dividend cache |
+| `~/.config/calendar-spread/positions.json` | Saved position tracker entries |
 | `~/.config/calendar-spread/credentials.json` | OAuth credentials (only if OS keyring is unavailable; mode 600) |
 
 ---

@@ -18,6 +18,7 @@ import websocket
 from datetime import datetime, timedelta
 import concurrent.futures
 import os
+import uuid
 import logging
 import subprocess
 from pathlib import Path
@@ -191,6 +192,35 @@ def save_settings(settings):
         _SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
     except Exception as exc:
         log.warning(f"Could not save settings file: {exc}")
+
+
+# ─── Positions persistence ───────────────────────────────────────────────────
+
+_POSITIONS_PATH = Path.home() / ".config" / "calendar-spread" / "positions.json"
+
+
+def load_positions():
+    try:
+        if _POSITIONS_PATH.exists():
+            data = json.loads(_POSITIONS_PATH.read_text())
+            if isinstance(data, list):
+                return data
+    except Exception as exc:
+        log.warning(f"Could not read positions file: {exc}")
+    return []
+
+
+def save_positions(positions):
+    try:
+        _POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Strip transient runtime fields (anything starting with '_').
+        sanitized = [
+            {k: v for k, v in p.items() if not k.startswith('_')}
+            for p in positions
+        ]
+        _POSITIONS_PATH.write_text(json.dumps(sanitized, indent=2))
+    except Exception as exc:
+        log.warning(f"Could not save positions file: {exc}")
 
 
 # ─── Ticker info cache (earnings / market cap / ex-div) ──────────────────────
@@ -1168,6 +1198,55 @@ def fmt_market_cap(cap):
     return f"${cap:.0f}"
 
 
+def resolve_position_legs(api, ticker, strike, front_expiry, back_expiry):
+    """Look up call-streamer-symbols + DTEs for a calendar position.
+
+    `front_expiry`/`back_expiry` are 'YYYY-MM-DD' strings; `strike` is a float.
+    Returns dict with keys: front_streamer_symbol, back_streamer_symbol,
+    front_dte, back_dte. Raises ValueError with a human-readable message if
+    the chain doesn't contain a matching expiration or strike.
+    """
+    chain_data = api.get_option_chain(ticker)
+    if not chain_data:
+        raise ValueError(f"No option chain returned for {ticker}")
+
+    expirations = chain_data[0].get('expirations', [])
+    by_date = {e.get('expiration-date'): e for e in expirations}
+
+    if front_expiry not in by_date:
+        raise ValueError(f"{ticker}: no expiration {front_expiry} in chain")
+    if back_expiry not in by_date:
+        raise ValueError(f"{ticker}: no expiration {back_expiry} in chain")
+
+    today = datetime.today().date()
+    f_date = datetime.strptime(front_expiry, '%Y-%m-%d').date()
+    b_date = datetime.strptime(back_expiry,  '%Y-%m-%d').date()
+
+    def find_strike(exp_entry, label):
+        for s in exp_entry.get('strikes', []):
+            try:
+                if abs(float(s.get('strike-price', 0)) - float(strike)) < 1e-6:
+                    return s
+            except (TypeError, ValueError):
+                continue
+        raise ValueError(f"{ticker}: no {label} strike {strike} on {exp_entry.get('expiration-date')}")
+
+    front_s = find_strike(by_date[front_expiry], 'front')
+    back_s  = find_strike(by_date[back_expiry],  'back')
+
+    front_sym = front_s.get('call-streamer-symbol') or front_s.get('call', '')
+    back_sym  = back_s.get('call-streamer-symbol')  or back_s.get('call', '')
+    if not front_sym or not back_sym:
+        raise ValueError(f"{ticker}: missing call-streamer-symbol on chain entry")
+
+    return {
+        'front_streamer_symbol': front_sym,
+        'back_streamer_symbol':  back_sym,
+        'front_dte': max((f_date - today).days, 0),
+        'back_dte':  max((b_date - today).days, 0),
+    }
+
+
 # ─── GUI ──────────────────────────────────────────────────────────────────────
 
 class FiltersWindow:
@@ -1332,6 +1411,110 @@ class FiltersWindow:
             return
         save_settings(settings)
         self.on_save(settings)
+        self.window.destroy()
+
+
+# ─── Add / Edit Position dialog ──────────────────────────────────────────────
+
+class PositionDialog:
+    """Modal dialog for entering or editing a calendar-spread position."""
+
+    def __init__(self, parent, on_save, existing=None):
+        self.on_save  = on_save
+        self.existing = existing
+        self.window = tk.Toplevel(parent)
+        self.window.title("Edit Position" if existing else "Add Position")
+        self.window.transient(parent)
+        self.window.grab_set()
+        self.window.resizable(False, False)
+
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+
+        def row(label, default='', width=14):
+            r = self._row
+            self._row += 1
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="e", padx=(0, 6), pady=3)
+            var = tk.StringVar(value=str(default))
+            ttk.Entry(body, textvariable=var, width=width).grid(
+                row=r, column=1, sticky="w", pady=3)
+            return var
+
+        self._row = 0
+        ex = existing or {}
+        self.ticker_var       = row("Ticker:",            ex.get('ticker', ''))
+        self.strike_var       = row("Strike ($):",        ex.get('strike', ''))
+        self.front_expiry_var = row("Front expiry (YYYY-MM-DD):", ex.get('front_expiry', ''))
+        self.back_expiry_var  = row("Back expiry (YYYY-MM-DD):",  ex.get('back_expiry', ''))
+        self.front_credit_var = row("Front leg credit ($):",      ex.get('front_credit', ''))
+        self.back_paid_var    = row("Back leg paid ($):",         ex.get('back_paid', ''))
+        self.contracts_var    = row("Contracts:",                 ex.get('contracts', 1))
+        self.notes_var        = row("Notes (optional):",          ex.get('notes', ''),
+                                    width=30)
+
+        hint = ttk.Label(
+            body,
+            text=("Expirations must match a date present in the option chain.\n"
+                  "Strike must match a listed strike. Credits are per-share\n"
+                  "(e.g. 1.50 means $150 per contract)."),
+            foreground="#666", font=("Helvetica", 8), justify="left",
+        )
+        hint.grid(row=self._row, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        self._row += 1
+
+        bar = ttk.Frame(body)
+        bar.grid(row=self._row, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(bar, text="Cancel", command=self.window.destroy).pack(side="right", padx=4)
+        ttk.Button(bar, text="Save" if existing else "Add",
+                   command=self._save).pack(side="right")
+
+    def _save(self):
+        try:
+            ticker  = self.ticker_var.get().strip().upper()
+            strike  = float(self.strike_var.get())
+            f_exp   = self.front_expiry_var.get().strip()
+            b_exp   = self.back_expiry_var.get().strip()
+            f_cred  = float(self.front_credit_var.get())
+            b_paid  = float(self.back_paid_var.get())
+            ctr_raw = self.contracts_var.get().strip() or '1'
+            ctr     = max(int(ctr_raw), 1)
+            notes   = self.notes_var.get().strip()
+        except (TypeError, ValueError) as e:
+            messagebox.showwarning("Invalid Input", f"Check numeric fields: {e}",
+                                   parent=self.window)
+            return
+
+        if not ticker:
+            messagebox.showwarning("Invalid Input", "Ticker is required.",
+                                   parent=self.window); return
+        try:
+            f_date = datetime.strptime(f_exp, '%Y-%m-%d').date()
+            b_date = datetime.strptime(b_exp, '%Y-%m-%d').date()
+        except ValueError:
+            messagebox.showwarning("Invalid Input",
+                                   "Expirations must be YYYY-MM-DD.",
+                                   parent=self.window); return
+        if not (b_date > f_date):
+            messagebox.showwarning("Invalid Input",
+                                   "Back expiry must be after front expiry.",
+                                   parent=self.window); return
+
+        position = dict(self.existing or {})
+        position.update({
+            'id':           position.get('id') or uuid.uuid4().hex[:12],
+            'ticker':       ticker,
+            'strike':       strike,
+            'front_expiry': f_exp,
+            'back_expiry':  b_exp,
+            'front_credit': f_cred,
+            'back_paid':    b_paid,
+            'contracts':    ctr,
+            'notes':        notes,
+        })
+        if not self.existing:
+            position['opened_on'] = datetime.today().date().isoformat()
+
+        self.on_save(position)
         self.window.destroy()
 
 
@@ -1537,6 +1720,7 @@ class CalendarScannerApp:
         self._row_data = {}
         self.settings = load_settings()
         self._api = None
+        self._api_lock = threading.Lock()
 
         # Live streaming state
         self._live_client          = None
@@ -1548,6 +1732,14 @@ class CalendarScannerApp:
         self._flash_widgets        = {}    # (iid, column_id) -> Tk Label overlay
         self._flash_columns        = ("Price", "F-Bid", "F-Ask", "B-Bid", "B-Ask")
         self._auto_sort_active     = False  # toggled by Fwd Factor header click
+
+        # Positions state
+        self.positions             = load_positions()
+        self._pos_live_client      = None
+        self._pos_sym_to_ids       = {}    # streamer-symbol -> set(position id)
+        self._pos_dirty_ids        = set()
+        self._pos_flush_pending    = False
+        self._pos_lock             = threading.Lock()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1569,6 +1761,12 @@ class CalendarScannerApp:
             log.warning("'keyring' is not installed — credentials will fall back to plaintext JSON")
         if not _MPL_AVAILABLE:
             log.warning("'matplotlib' is not installed — P/L chart will be unavailable")
+
+        # Auto-start positions live stream if credentials and positions exist.
+        # Deferred so the UI is visible before any network activity begins.
+        if self.positions and (self.client_secret_var.get().strip()
+                               and self.refresh_token_var.get().strip()):
+            self.root.after(800, self._pos_kick_live)
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
 
@@ -1627,12 +1825,15 @@ class CalendarScannerApp:
         nb = ttk.Notebook(self.right_frame)
         nb.pack(fill="both", expand=True)
 
-        results_tab = ttk.Frame(nb)
-        debug_tab   = ttk.Frame(nb)
-        nb.add(results_tab, text="  Results  ")
-        nb.add(debug_tab,   text="  Debug Log  ")
+        results_tab   = ttk.Frame(nb)
+        positions_tab = ttk.Frame(nb)
+        debug_tab     = ttk.Frame(nb)
+        nb.add(results_tab,   text="  Results  ")
+        nb.add(positions_tab, text="  Positions  ")
+        nb.add(debug_tab,     text="  Debug Log  ")
 
         self._build_results_tab(results_tab)
+        self._build_positions_tab(positions_tab)
         self._build_debug_tab(debug_tab)
 
     def _build_results_tab(self, parent):
@@ -1759,6 +1960,225 @@ class CalendarScannerApp:
                                  stderr=subprocess.DEVNULL)
         except Exception:
             messagebox.showinfo("Log File", f"Log location:\n{_LOG_PATH}")
+
+    # ── Positions tab ─────────────────────────────────────────────────────────
+
+    POSITIONS_COLUMNS = (
+        "Ticker", "Strike", "F-Exp", "B-Exp", "F-DTE", "B-DTE", "Ctr",
+        "Front Cr", "Back Pd", "F-Bid", "F-Ask", "B-Bid", "B-Ask",
+        "Front IV", "Back IV", "Fwd IV", "Cur FF", "Open FF",
+        "Cur Debit", "P/L $",
+    )
+
+    def _build_positions_tab(self, parent):
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x", pady=(4, 4), padx=4)
+        ttk.Button(toolbar, text="Add Position…",
+                   command=self._pos_add).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Edit",
+                   command=self._pos_edit).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Remove",
+                   command=self._pos_remove).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Chart P/L",
+                   command=self._pos_chart).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Reconnect Live",
+                   command=self._pos_reconnect_live).pack(side="left", padx=10)
+
+        self.pos_status_var = tk.StringVar(value="No live connection")
+        ttk.Label(toolbar, textvariable=self.pos_status_var,
+                  foreground="#666").pack(side="right", padx=8)
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=4)
+
+        col_widths = {
+            "Ticker": 60, "Strike": 64, "F-Exp": 84, "B-Exp": 84,
+            "F-DTE": 50, "B-DTE": 50, "Ctr": 38,
+            "Front Cr": 70, "Back Pd": 70,
+            "F-Bid": 60, "F-Ask": 60, "B-Bid": 60, "B-Ask": 60,
+            "Front IV": 64, "Back IV": 64, "Fwd IV": 64,
+            "Cur FF": 64, "Open FF": 64, "Cur Debit": 70, "P/L $": 72,
+        }
+        self.pos_tree = ttk.Treeview(tree_frame, columns=self.POSITIONS_COLUMNS,
+                                     show="headings")
+        for col in self.POSITIONS_COLUMNS:
+            self.pos_tree.heading(col, text=col)
+            self.pos_tree.column(col, width=col_widths.get(col, 70), anchor="center")
+
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
+                            command=self.pos_tree.yview)
+        self.pos_tree.configure(yscrollcommand=vsb.set)
+        self.pos_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.pos_tree.bind("<Double-1>", lambda _e: self._pos_chart())
+
+        bottom = ttk.Frame(parent, padding=(8, 4))
+        bottom.pack(fill="x")
+        ttk.Label(bottom, text="Total P/L:",
+                  font=("Helvetica", 11, "bold")).pack(side="left")
+        self.pos_total_var = tk.StringVar(value="$0.00")
+        ttk.Label(bottom, textvariable=self.pos_total_var,
+                  font=("Helvetica", 11, "bold"),
+                  foreground="royalblue").pack(side="left", padx=8)
+        ttk.Label(bottom, text="(per current mid + live underlying)",
+                  foreground="#666", font=("Helvetica", 8)).pack(side="left", padx=4)
+
+        self._pos_refresh_table()
+
+    def _pos_get_by_id(self, pid):
+        return next((p for p in self.positions if p.get('id') == pid), None)
+
+    def _pos_refresh_table(self):
+        """Rebuild the table from self.positions; preserves selection."""
+        sel = self.pos_tree.selection()
+        for iid in self.pos_tree.get_children():
+            self.pos_tree.delete(iid)
+        for p in self.positions:
+            self.pos_tree.insert("", tk.END, iid=p['id'],
+                                 values=self._pos_row_values(p))
+        if sel and self._pos_get_by_id(sel[0]):
+            self.pos_tree.selection_set(sel[0])
+        self._pos_update_total()
+
+    def _pos_current_dtes(self, position):
+        today = datetime.today().date()
+        try:
+            f = datetime.strptime(position['front_expiry'], '%Y-%m-%d').date()
+            b = datetime.strptime(position['back_expiry'],  '%Y-%m-%d').date()
+        except (KeyError, ValueError):
+            return 0, 0
+        return max((f - today).days, 0), max((b - today).days, 0)
+
+    def _pos_row_values(self, p):
+        f_dte, b_dte = self._pos_current_dtes(p)
+
+        def f_money(v):
+            return f"${v:.2f}" if isinstance(v, (int, float)) else "—"
+        def f_iv(v):
+            return f"{v * 100:.2f}%" if isinstance(v, (int, float)) and v > 0 else "—"
+        def f_pct_signed(v):
+            return f"{v * 100:+.2f}%" if isinstance(v, (int, float)) else "—"
+
+        cur_debit = p.get('_cur_debit')
+        pl        = p.get('_cur_pl')
+        return (
+            p['ticker'],
+            f"${p['strike']:.2f}",
+            p['front_expiry'],
+            p['back_expiry'],
+            f_dte, b_dte,
+            p.get('contracts', 1),
+            f"${p['front_credit']:.2f}",
+            f"${p['back_paid']:.2f}",
+            f_money(p.get('_f_bid')), f_money(p.get('_f_ask')),
+            f_money(p.get('_b_bid')), f_money(p.get('_b_ask')),
+            f_iv(p.get('_front_iv')), f_iv(p.get('_back_iv')), f_iv(p.get('_fwd_iv')),
+            f_pct_signed(p.get('_fwd_factor')),
+            f_pct_signed(p.get('opened_fwd_factor')),
+            f_money(cur_debit),
+            f"${pl:.2f}" if isinstance(pl, (int, float)) else "—",
+        )
+
+    def _pos_update_total(self):
+        total = sum(p.get('_cur_pl', 0.0) or 0.0 for p in self.positions)
+        self.pos_total_var.set(f"${total:.2f}")
+
+    # — toolbar actions —
+
+    def _pos_add(self):
+        PositionDialog(self.root, on_save=self._pos_on_saved)
+
+    def _pos_edit(self):
+        sel = self.pos_tree.selection()
+        if not sel:
+            messagebox.showinfo("Edit Position", "Select a position to edit.")
+            return
+        p = self._pos_get_by_id(sel[0])
+        if p:
+            PositionDialog(self.root, on_save=self._pos_on_saved, existing=p)
+
+    def _pos_remove(self):
+        sel = self.pos_tree.selection()
+        if not sel:
+            return
+        pid = sel[0]
+        p = self._pos_get_by_id(pid)
+        if not p:
+            return
+        if not messagebox.askyesno(
+            "Remove Position",
+            f"Remove {p['ticker']} {p['strike']:.2f} "
+            f"{p['front_expiry']}/{p['back_expiry']}?"):
+            return
+        self.positions = [q for q in self.positions if q.get('id') != pid]
+        save_positions(self.positions)
+        self._pos_refresh_table()
+        # Re-subscribe (some streamer symbols may no longer be needed; we leave
+        # already-subscribed symbols in place — DXLink will just keep streaming
+        # them harmlessly until reconnect)
+        self._pos_resubscribe()
+
+    def _pos_chart(self):
+        if not _MPL_AVAILABLE:
+            messagebox.showwarning(
+                "Matplotlib missing",
+                "Install matplotlib to use the P/L chart.")
+            return
+        sel = self.pos_tree.selection()
+        if not sel:
+            messagebox.showinfo("Chart P/L", "Select a position to chart.")
+            return
+        p = self._pos_get_by_id(sel[0])
+        if not p:
+            return
+        price = p.get('_underlying_price') or p.get('opened_underlying_price') or 0.0
+        if price <= 0:
+            messagebox.showwarning(
+                "No live price",
+                f"No live underlying price yet for {p['ticker']}. "
+                "Wait for the live stream to populate before charting.")
+            return
+        f_dte, b_dte = self._pos_current_dtes(p)
+        if f_dte <= 0 or b_dte <= f_dte:
+            messagebox.showwarning(
+                "Bad DTE",
+                f"{p['ticker']}: front DTE={f_dte}, back DTE={b_dte}. "
+                "Chart requires a future front expiry and back > front.")
+            return
+        PLChartWindow(
+            self.root,
+            ticker=p['ticker'],
+            price=price,
+            strike=p['strike'],
+            front_dte=f_dte,
+            back_dte=b_dte,
+            back_paid=p['back_paid'],
+            front_credit=p['front_credit'],
+            current_back_iv=p.get('_back_iv', 0.0) or 0.0,
+            fwd_iv=p.get('_fwd_iv', 0.0) or 0.0,
+        )
+
+    def _pos_on_saved(self, position):
+        """Callback from PositionDialog — insert or update, persist, resubscribe."""
+        existing = self._pos_get_by_id(position['id'])
+        if existing is not None:
+            # If any chain-identifying field changed, drop cached streamer symbols
+            # and live values so the resolver re-runs and metrics recompute.
+            keys = ('ticker', 'strike', 'front_expiry', 'back_expiry')
+            if any(existing.get(k) != position.get(k) for k in keys):
+                for k in ('_front_sym', '_back_sym', '_resolve_error',
+                          '_underlying_price', '_f_bid', '_f_ask',
+                          '_b_bid', '_b_ask', '_front_iv', '_back_iv',
+                          '_fwd_iv', '_fwd_factor', '_cur_debit', '_cur_pl'):
+                    existing.pop(k, None)
+            # Update in place; preserves remaining live (_*) fields and opened_* snapshots
+            for k, v in position.items():
+                existing[k] = v
+        else:
+            self.positions.append(position)
+        save_positions(self.positions)
+        self._pos_refresh_table()
+        self._pos_resubscribe()
 
     # ── Row select / trade analysis ───────────────────────────────────────────
 
@@ -2457,10 +2877,266 @@ class CalendarScannerApp:
             except tk.TclError: pass
         self.root.after(700, cleanup)
 
+    # ── Positions: live streaming ─────────────────────────────────────────────
+
+    def _pos_ensure_api(self):
+        """Return a TastytradeAPI instance, lazily authenticating with the
+        currently-entered (or saved) credentials. Thread-safe."""
+        with self._api_lock:
+            if self._api is not None:
+                return self._api
+            secret  = (self.client_secret_var.get() or '').strip()
+            refresh = (self.refresh_token_var.get() or '').strip()
+            if not secret or not refresh:
+                raise RuntimeError("Tastytrade OAuth credentials are not set")
+            self._api = TastytradeAPI(secret, refresh)
+            return self._api
+
+    def _pos_resolve_legs(self, api, position):
+        """Populate _front_sym / _back_sym on `position` (mutates).
+        Returns True on success, False on error (logged)."""
+        try:
+            res = resolve_position_legs(
+                api, position['ticker'],
+                float(position['strike']),
+                position['front_expiry'],
+                position['back_expiry'],
+            )
+        except Exception as exc:
+            log.error(f"Position {position.get('ticker')} chain resolve failed: {exc}")
+            position['_resolve_error'] = str(exc)
+            return False
+        position['_front_sym'] = res['front_streamer_symbol']
+        position['_back_sym']  = res['back_streamer_symbol']
+        position['_resolve_error'] = None
+        return True
+
+    def _pos_kick_live(self):
+        """Start (or extend) the positions live stream in a background thread.
+        Idempotent: if already connected, just resolves any unresolved positions
+        and subscribes their symbols."""
+        if not self.positions:
+            return
+        threading.Thread(target=self._pos_live_worker, daemon=True).start()
+
+    def _pos_set_status(self, msg):
+        self.root.after(0, lambda: self.pos_status_var.set(msg))
+
+    def _pos_live_worker(self):
+        try:
+            api = self._pos_ensure_api()
+        except Exception as exc:
+            log.warning(f"Positions live: auth not ready ({exc})")
+            self._pos_set_status(f"Live: {exc}")
+            return
+
+        # Resolve any positions that don't yet have streamer symbols.
+        unresolved = [p for p in self.positions if not p.get('_front_sym')]
+        for p in unresolved:
+            self._pos_set_status(f"Resolving {p['ticker']} chain…")
+            self._pos_resolve_legs(api, p)
+
+        # (Re)connect the live client if needed
+        client = self._pos_live_client
+        if client is None:
+            self._pos_set_status("Connecting live stream…")
+            try:
+                client = DXLinkLiveClient(api)
+                client.set_quote_callback(self._pos_on_live_quote)
+                client.connect(timeout=30)
+            except Exception as exc:
+                log.error(f"Positions live: connect failed: {exc}")
+                self._pos_set_status(f"Live: connect failed ({exc})")
+                self._pos_live_client = None
+                return
+            self._pos_live_client = client
+
+        # Build subscription set
+        sym_to_ids   = {}
+        equity_set   = set()
+        for p in self.positions:
+            if p.get('_resolve_error'):
+                continue
+            for sym in (p['ticker'], p.get('_front_sym'), p.get('_back_sym')):
+                if sym:
+                    sym_to_ids.setdefault(sym, set()).add(p['id'])
+            equity_set.add(p['ticker'])
+
+        # Track per-symbol subscribers (used by quote callback)
+        self._pos_sym_to_ids = sym_to_ids
+
+        try:
+            client.subscribe(list(sym_to_ids.keys()), with_trade_for=equity_set)
+        except Exception as exc:
+            log.warning(f"Positions live subscribe failed: {exc}")
+        n_pos = sum(1 for p in self.positions if not p.get('_resolve_error'))
+        self._pos_set_status(f"Live: streaming {n_pos} position(s)")
+
+    def _pos_resubscribe(self):
+        """Called after add/remove — re-build streamer-sym map and subscribe."""
+        if self._pos_live_client is None:
+            self._pos_kick_live()
+        else:
+            self._pos_kick_live()  # worker handles add-only subscription
+
+    def _pos_reconnect_live(self):
+        """Manual: close current client and reconnect."""
+        self._pos_stop_live_streaming()
+        # Clear cached streamer symbols so they're re-resolved against a fresh chain
+        for p in self.positions:
+            p.pop('_front_sym', None)
+            p.pop('_back_sym',  None)
+            p.pop('_resolve_error', None)
+        self._pos_kick_live()
+
+    def _pos_stop_live_streaming(self):
+        client = self._pos_live_client
+        self._pos_live_client = None
+        self._pos_sym_to_ids = {}
+        with self._pos_lock:
+            self._pos_dirty_ids.clear()
+            self._pos_flush_pending = False
+        if client is not None:
+            try:
+                client.close()
+            except Exception as exc:
+                log.warning(f"Error closing positions live client: {exc}")
+        self._pos_set_status("No live connection")
+
+    def _pos_on_live_quote(self, symbol, _quote):
+        """Called from the WS thread on every quote update."""
+        ids = self._pos_sym_to_ids.get(symbol)
+        if not ids:
+            return
+        with self._pos_lock:
+            self._pos_dirty_ids.update(ids)
+            if self._pos_flush_pending:
+                return
+            self._pos_flush_pending = True
+        self.root.after(self.LIVE_FLUSH_MS, self._pos_flush_live)
+
+    def _pos_flush_live(self):
+        with self._pos_lock:
+            dirty = list(self._pos_dirty_ids)
+            self._pos_dirty_ids.clear()
+            self._pos_flush_pending = False
+
+        client = self._pos_live_client
+        if client is None or not dirty:
+            return
+
+        any_changed = False
+        for pid in dirty:
+            p = self._pos_get_by_id(pid)
+            if not p:
+                continue
+            try:
+                if self._pos_refresh_from_live(p, client):
+                    any_changed = True
+            except Exception as exc:
+                log.debug(f"position live refresh {p.get('ticker')}: {exc}")
+
+        if any_changed:
+            for p in self.positions:
+                if self.pos_tree.exists(p['id']):
+                    self.pos_tree.item(p['id'], values=self._pos_row_values(p))
+            self._pos_update_total()
+            # Persist any newly-snapshotted opened_* fields
+            save_positions(self.positions)
+
+    def _pos_refresh_from_live(self, p, client):
+        """Mutate position dict with current live metrics. Return True on update."""
+        eq = client.get_quote(p['ticker'])
+        last         = eq.get('last', 0)
+        e_bid, e_ask = eq.get('bid', 0), eq.get('ask', 0)
+        price = (last if last > 0
+                 else ((e_bid + e_ask) / 2 if e_bid > 0 and e_ask > 0 else 0))
+        if price <= 0:
+            return False
+
+        fq = client.get_quote(p.get('_front_sym', ''))
+        bq = client.get_quote(p.get('_back_sym',  ''))
+        f_bid, f_ask = fq.get('bid', 0), fq.get('ask', 0)
+        b_bid, b_ask = bq.get('bid', 0), bq.get('ask', 0)
+
+        f_dte_cur, b_dte_cur = self._pos_current_dtes(p)
+        contracts = int(p.get('contracts', 1) or 1)
+        strike    = float(p['strike'])
+
+        p['_underlying_price'] = price
+        if f_bid > 0: p['_f_bid'] = f_bid
+        if f_ask > 0: p['_f_ask'] = f_ask
+        if b_bid > 0: p['_b_bid'] = b_bid
+        if b_ask > 0: p['_b_ask'] = b_ask
+
+        # Need at least one bid/ask pair on each leg to compute IVs / P/L
+        f_bid = p.get('_f_bid', 0); f_ask = p.get('_f_ask', 0)
+        b_bid = p.get('_b_bid', 0); b_ask = p.get('_b_ask', 0)
+
+        if f_bid > 0 and f_ask > 0 and b_bid > 0 and b_ask > 0 and f_dte_cur > 0 and b_dte_cur > f_dte_cur:
+            iv_method = self._live_iv_method
+            t1 = f_dte_cur / 365.0
+            t2 = b_dte_cur / 365.0
+            if iv_method == "Bid Front / Ask Back":
+                f_iv = calc_implied_vol(f_bid,             price, strike, t1)
+                b_iv = calc_implied_vol(b_ask,             price, strike, t2)
+            else:
+                f_iv = calc_implied_vol((f_bid + f_ask)/2, price, strike, t1)
+                b_iv = calc_implied_vol((b_bid + b_ask)/2, price, strike, t2)
+            if f_iv > 0.01 and b_iv > 0.01:
+                var_diff = t2 * b_iv**2 - t1 * f_iv**2
+                if var_diff > 0:
+                    fwd_iv = math.sqrt(var_diff / (t2 - t1))
+                    if fwd_iv > 0:
+                        p['_front_iv']   = f_iv
+                        p['_back_iv']    = b_iv
+                        p['_fwd_iv']     = fwd_iv
+                        p['_fwd_factor'] = (f_iv - fwd_iv) / fwd_iv
+
+        # Current net debit (mid) and per-contract / total P/L vs entry
+        if f_bid > 0 and f_ask > 0 and b_bid > 0 and b_ask > 0:
+            cur_front_mid = (f_bid + f_ask) / 2
+            cur_back_mid  = (b_bid + b_ask) / 2
+            cur_debit_per_share = cur_back_mid - cur_front_mid
+            entry_debit_per_share = float(p['back_paid']) - float(p['front_credit'])
+            pl_per_share = cur_debit_per_share - entry_debit_per_share
+            p['_cur_debit'] = cur_debit_per_share
+            p['_cur_pl']    = pl_per_share * 100 * contracts
+
+        # One-shot snapshot of opened_* fields the first time we have live data
+        if p.get('opened_fwd_factor') is None and p.get('_fwd_factor') is not None:
+            # Use today's underlying price + the entry credits to compute the IVs
+            # implied at trade open. DTEs are taken from `opened_on` if present,
+            # else today's DTEs (positions added today).
+            opened_on = _parse_iso_date(p.get('opened_on'))
+            if opened_on is not None:
+                f_date = datetime.strptime(p['front_expiry'], '%Y-%m-%d').date()
+                b_date = datetime.strptime(p['back_expiry'],  '%Y-%m-%d').date()
+                f_dte0 = max((f_date - opened_on).days, 1)
+                b_dte0 = max((b_date - opened_on).days, f_dte0 + 1)
+            else:
+                f_dte0, b_dte0 = max(f_dte_cur, 1), max(b_dte_cur, f_dte_cur + 1)
+            t10, t20 = f_dte0 / 365.0, b_dte0 / 365.0
+            f_iv0 = calc_implied_vol(float(p['front_credit']), price, strike, t10)
+            b_iv0 = calc_implied_vol(float(p['back_paid']),    price, strike, t20)
+            if f_iv0 > 0.01 and b_iv0 > 0.01:
+                var0 = t20 * b_iv0**2 - t10 * f_iv0**2
+                if var0 > 0:
+                    fwd_iv0 = math.sqrt(var0 / (t20 - t10))
+                    if fwd_iv0 > 0:
+                        p['opened_underlying_price'] = price
+                        p['opened_front_iv']         = f_iv0
+                        p['opened_back_iv']          = b_iv0
+                        p['opened_fwd_iv']           = fwd_iv0
+                        p['opened_fwd_factor']       = (f_iv0 - fwd_iv0) / fwd_iv0
+
+        return True
+
     # ── Window close ──────────────────────────────────────────────────────────
 
     def _on_close(self):
         self._stop_live_streaming()
+        self._pos_stop_live_streaming()
         self.root.destroy()
 
     # ── Finish scan ───────────────────────────────────────────────────────────
