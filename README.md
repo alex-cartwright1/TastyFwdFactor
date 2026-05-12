@@ -1,6 +1,6 @@
 # Calendar Spread Edge Screener
 
-**Website:** [tastyfwdfactor.cch.tech](https://tastyfwdfactor.cch-uk.tech)
+**Website:** [tastyfwdfactor.cch-uk.tech](https://tastyfwdfactor.cch-uk.tech)
 
 A Tkinter GUI that scans a watchlist for calendar spread setups, and ranks them by forward factor. Also allows you to analyse individual trades with a real-time P/L chart, and track open positions with live P/L.
 
