@@ -90,6 +90,24 @@ def save_credentials(client_secret, refresh_token):
         log.warning(f"Could not save credentials file: {exc}")
 
 
+def clear_credentials():
+    """Forget stored credentials — used when the user unticks 'Remember me' or
+    signs out. Clears both the keyring entries and the JSON fallback, since
+    either may hold a value from an earlier run."""
+    if KEYRING_AVAILABLE:
+        for key in ("client_secret", "refresh_token"):
+            try:
+                keyring.delete_password(_KEYRING_SERVICE, key)
+            except Exception:
+                pass      # not set is the normal case, not an error
+    try:
+        if _LEGACY_CREDS_PATH.exists():
+            _LEGACY_CREDS_PATH.unlink()
+    except Exception as exc:
+        log.warning(f"Could not remove credentials file: {exc}")
+    log.info("Stored credentials cleared")
+
+
 # ─── Settings ────────────────────────────────────────────────────────────────
 
 DEFAULT_SETTINGS = {

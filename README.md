@@ -39,6 +39,12 @@ libraries:
 sudo apt install libgl1 libxkbcommon-x11-0 libegl1
 ```
 
+The interface prefers the **Inter** typeface and falls back to Segoe UI / Roboto / Noto Sans / DejaVu Sans. For the intended look on Linux:
+
+```bash
+sudo apt install fonts-inter
+```
+
 **Optional but recommended:**
 
 | Package | Purpose |
@@ -70,7 +76,7 @@ The app authenticates with the Tastytrade **production** API using OAuth long-li
 2. Create an OAuth application to obtain a **Client Secret**.
 3. Create a grant for the OAuth application to obtain a **Refresh Token** for your account, make sure to only give the grant **read** access. 
 
-Both values are entered in the app's sidebar when you launch it. They are saved to the OS keyring (or `~/.config/calendar-spread/credentials.json` if no keyring backend is available) and pre-filled on future launches.
+Both values are entered on the app's sign-in screen. With **Remember me** ticked they are saved to the OS keyring (or `~/.config/calendar-spread/credentials.json`, mode 600, if no keyring backend is available) and pre-filled on future launches. Unticking it clears anything already stored.
 
 ---
 
@@ -80,15 +86,19 @@ Both values are entered in the app's sidebar when you launch it. They are saved 
 python main.py
 ```
 
-1. Enter your **Client Secret** and **Refresh Token** in the left sidebar.
-2. Click **Filters & Scan Settings…** to configure your watchlist path, target DTEs, IV method, and any filters you want.
-3. Click **Run Scanner**.
+1. Sign in with your **Client Secret** and **Refresh Token**. The grant is verified against Tastytrade before the dashboard opens.
+2. On the **Scanner** view, click **Filters** to configure your watchlist path, target DTEs, IV method, and any filters you want.
+3. Click **Run Scan**. The button becomes **Cancel** while a scan is in flight.
+
+The left rail switches between **Scanner**, **Positions**, **Settings** and **Logs**, and collapses to icons if you want more room for the table. **Settings** also holds *Sign out* and *Clear ticker cache*.
+
+Live quotes flash green or red on the cell that changed, and P/L and forward-factor columns are coloured by sign.
 
 ---
 
 ## Scan settings reference
 
-Open **Filters & Scan Settings…** from the sidebar to configure the following.
+Open **Filters** from the Scanner view (or *Settings → Open filters & scan settings*) to configure the following.
 
 ### Scan parameters
 
@@ -182,7 +192,7 @@ The **Positions** tab lets you track open calendar spread positions with live P/
 
 ### Adding a position
 
-- Click **Add Position** in the Positions tab, or select a row in the scan results and click **Add to Positions** to pre-populate the legs from that scan result.
+- Click **Add Position** on the Positions view.
 - In the dialog, enter the ticker, strike, front and back expiry dates, and the prices you actually paid/received for each leg.
 
 ### Live P/L
@@ -207,16 +217,16 @@ Positions are saved automatically to `~/.config/calendar-spread/positions.json` 
 
 ## Troubleshooting
 
-**Credentials warning in red**
-The `keyring` package is installed but no compatible secret store was found (common on WSL2 or headless Linux). Credentials fall back to `~/.config/calendar-spread/credentials.json` with restricted permissions. Install `keyrings.cryptfile` for an encrypted file-based alternative: `pip install keyrings.cryptfile`.
+**Keyring warning on the sign-in screen**
+No compatible secret store was found (common on WSL2 or headless Linux). Credentials fall back to `~/.config/calendar-spread/credentials.json` with restricted permissions. Install `keyrings.cryptfile` for an encrypted file-based alternative: `pip install keyrings.cryptfile`.
 
 **No quotes returned / DXLink timeout**
-DXLink quote tokens expire. The app fetches a fresh token before each scan. If the scan stalls at Phase 2, check the Debug Log tab for `AUTH_STATE` errors and verify your refresh token is still valid.
+DXLink quote tokens expire. The app fetches a fresh token before each scan. If the scan stalls at Phase 2, check the Logs view for `AUTH_STATE` errors and verify your refresh token is still valid.
 
 **Empty results after scanning**
 - Check that your watchlist CSV has a `TICKER` header and one symbol per line.
-- Relax the earnings / market cap / price filters in **Filters & Scan Settings…**.
-- Open the **Debug Log** tab to see per-ticker rejection reasons.
+- Relax the earnings / market cap / price filters in **Filters**.
+- Open the **Logs** view to see per-ticker rejection reasons.
 
 **`qt.qpa.plugin: Could not load the Qt platform plugin "xcb"`**
 Install the X/XCB runtime libraries listed under [Installation](#installation).

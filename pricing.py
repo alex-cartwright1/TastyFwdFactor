@@ -49,7 +49,13 @@ def bs_call_vec(S_arr, K, T, r, sigma):
 
 def calc_implied_vol(target_price, S, K, T, r=RISK_FREE_RATE):
     """Newton solve for call IV. Returns >= 0.001 so callers can reject on a
-    floor test rather than on None."""
+    floor test rather than on None.
+
+    The result is coerced to a plain `float`: `sigma` picks up numpy's dtype from
+    the vega term, and a `np.float64` reaching a Qt model breaks sorting outright
+    — PySide can't convert it to a QVariant double, so `lessThan` ends up
+    comparing opaque objects. It stays a float subclass, so nothing else notices.
+    """
     if target_price <= 0 or S <= 0 or K <= 0 or T <= 0:
         return 0.001
     sigma = 0.5
@@ -60,11 +66,11 @@ def calc_implied_vol(target_price, S, K, T, r=RISK_FREE_RATE):
         ) * np.sqrt(T))
         diff = target_price - price
         if abs(diff) < 1e-5:
-            return max(sigma, 0.001)
+            return float(max(sigma, 0.001))
         if vega < 1e-4:
             break
         sigma += diff / vega
-    return max(sigma, 0.001)
+    return float(max(sigma, 0.001))
 
 
 # ─── Forward factor ──────────────────────────────────────────────────────────
@@ -171,7 +177,10 @@ def fmt_market_cap(cap):
 
 
 def fmt_money(v):
-    return f"${v:.2f}" if isinstance(v, (int, float)) else "—"
+    """Sign goes outside the currency symbol: -$15.00, not $-15.00."""
+    if not isinstance(v, (int, float)):
+        return "—"
+    return f"-${abs(v):.2f}" if v < 0 else f"${v:.2f}"
 
 
 def fmt_iv(v):

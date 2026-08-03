@@ -6,8 +6,12 @@ only, so a 50-row stream repaints a handful of cells rather than rebuilding a
 table.
 
 Both models share the `Column` descriptor: a header, a raw-value getter, a
-formatter, and whether the cell flashes on change. Flashes are a
-`BackgroundRole` lookup with a single expiry timer — no overlay widgets.
+formatter, and whether the cell flashes on change.
+
+Rendering lives in `delegates.py`. These models publish *what* a cell is —
+comparable value, signed-ness, and how recently a live tick changed it — through
+custom roles, and the delegate decides how that looks. A single timer ages the
+flash records so the delegate can fade them out.
 """
 
 import time
@@ -15,21 +19,20 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
-from PySide6.QtGui import QBrush, QColor
 
 from data_models import Position, ScanResult
 from pricing import fmt_iv, fmt_market_cap, fmt_money, fmt_pct_signed
 
-FLASH_MS       = 700
-FLASH_TICK_MS  = 150
-SORT_ROLE      = int(Qt.ItemDataRole.UserRole) + 1
+FLASH_MS      = 900
+FLASH_TICK_MS = 40      # ~25fps, so the delegate can fade the flash out smoothly
 
-_FLASH_UP   = QColor("#2e7d32")
-_FLASH_DOWN = QColor("#c62828")
-_FLASH_TEXT = QColor("#ffffff")
-_POS_TEXT   = QColor("#2e7d32")
-_NEG_TEXT   = QColor("#c62828")
-_MUTED      = QColor("#888888")
+# Custom roles. The model stays a pure data provider: it publishes *what* a cell
+# is (comparable value, signed-ness, how fresh its last change is) and the
+# delegate decides how that looks.
+SORT_ROLE   = int(Qt.ItemDataRole.UserRole) + 1
+SIGNED_ROLE = int(Qt.ItemDataRole.UserRole) + 2   # bool: colour by sign
+FLASH_ROLE  = int(Qt.ItemDataRole.UserRole) + 3   # (progress 1→0, is_up) or None
+NUMERIC_ROLE = int(Qt.ItemDataRole.UserRole) + 4  # raw value, or None
 
 
 @dataclass(frozen=True)
@@ -43,8 +46,16 @@ class Column:
 
 
 def _num(v):
-    """Sort key that keeps missing values at the bottom."""
-    return v if isinstance(v, (int, float)) else float('-inf')
+    """Sort key that keeps missing values at the bottom.
+
+    Coerced to a built-in float because a numpy scalar (which *is* a float
+    subclass, so it passes every isinstance check) reaches Qt as an opaque Python
+    object rather than a QVariant double, and `lessThan` then orders rows
+    arbitrarily. `pricing` returns plain floats; this is the backstop.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return float('-inf')
+    return float(v)
 
 
 def _pct(v):
@@ -62,7 +73,7 @@ class _FlashTableModel(QAbstractTableModel):
         self._flashes = {}        # (row, col) -> (expires_at, is_up)
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(FLASH_TICK_MS)
-        self._flash_timer.timeout.connect(self._expire_flashes)
+        self._flash_timer.timeout.connect(self._tick_flashes)
 
     # ── Qt interface ──
 
@@ -94,17 +105,17 @@ class _FlashTableModel(QAbstractTableModel):
             return _num(value) if isinstance(value, (int, float, type(None))) else str(value)
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return int(Qt.AlignmentFlag.AlignCenter)
-
-        flash = self._flashes.get((row, col))
-        if role == Qt.ItemDataRole.BackgroundRole and flash:
-            return QBrush(_FLASH_UP if flash[1] else _FLASH_DOWN)
-        if role == Qt.ItemDataRole.ForegroundRole:
-            if flash:
-                return QBrush(_FLASH_TEXT)
-            if spec.signed and isinstance(value, (int, float)):
-                return QBrush(_POS_TEXT if value >= 0 else _NEG_TEXT)
-            if value is None:
-                return QBrush(_MUTED)
+        if role == SIGNED_ROLE:
+            return spec.signed
+        if role == NUMERIC_ROLE:
+            return value if isinstance(value, (int, float)) else None
+        if role == FLASH_ROLE:
+            flash = self._flashes.get((row, col))
+            if flash is None:
+                return None
+            expires, is_up = flash
+            remaining = expires - time.monotonic()
+            return (max(0.0, min(1.0, remaining / (FLASH_MS / 1000.0))), is_up)
         return None
 
     # ── row access ──
@@ -141,17 +152,19 @@ class _FlashTableModel(QAbstractTableModel):
         if not self._flash_timer.isActive():
             self._flash_timer.start()
 
-    def _expire_flashes(self):
+    def _tick_flashes(self):
+        """Repaint every cell with a live flash so the delegate can fade it out,
+        then drop the ones that have finished."""
         now = time.monotonic()
+        active  = list(self._flashes)
         expired = [key for key, (until, _) in self._flashes.items() if until <= now]
         for key in expired:
             del self._flashes[key]
         if not self._flashes:
             self._flash_timer.stop()
-        for row, col in expired:
+        for row, col in active:
             idx = self.index(row, col)
-            self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.BackgroundRole,
-                                             Qt.ItemDataRole.ForegroundRole])
+            self.dataChanged.emit(idx, idx, [FLASH_ROLE])
 
     def clear_flashes(self):
         if not self._flashes:
@@ -161,8 +174,7 @@ class _FlashTableModel(QAbstractTableModel):
         self._flash_timer.stop()
         for row, col in cells:
             idx = self.index(row, col)
-            self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.BackgroundRole,
-                                             Qt.ItemDataRole.ForegroundRole])
+            self.dataChanged.emit(idx, idx, [FLASH_ROLE])
 
 
 # ─── Results ─────────────────────────────────────────────────────────────────
@@ -173,7 +185,7 @@ class ScanResultsModel(_FlashTableModel):
     COLUMNS = [
         Column("Ticker",     lambda r: r.ticker,     str,             width=62),
         Column("Price",      lambda r: r.price,      fmt_money,       width=72, flash=True),
-        Column("Mkt Cap",    lambda r: r.market_cap, fmt_market_cap,  width=80),
+        Column("Mkt Cap",    lambda r: r.market_cap, fmt_market_cap,  width=86),
         Column("Strike",     lambda r: r.strike,     fmt_money,       width=72),
         Column("F-DTE",      lambda r: r.front_dte,  str,             width=52),
         Column("B-DTE",      lambda r: r.back_dte,   str,             width=52),
@@ -181,14 +193,14 @@ class ScanResultsModel(_FlashTableModel):
         Column("F-Ask",      lambda r: r.f_ask,      fmt_money,       width=62, flash=True),
         Column("B-Bid",      lambda r: r.b_bid,      fmt_money,       width=62, flash=True),
         Column("B-Ask",      lambda r: r.b_ask,      fmt_money,       width=62, flash=True),
-        Column("Front IV",   lambda r: r.front_iv,   _pct,            width=70),
-        Column("Back IV",    lambda r: r.back_iv,    _pct,            width=70),
-        Column("Fwd IV",     lambda r: r.fwd_iv,     _pct,            width=70),
-        Column("Fwd Factor", lambda r: r.fwd_factor, fmt_pct_signed,  width=86, signed=True),
+        Column("Front IV",   lambda r: r.front_iv,   _pct,            width=76),
+        Column("Back IV",    lambda r: r.back_iv,    _pct,            width=76),
+        Column("Fwd IV",     lambda r: r.fwd_iv,     _pct,            width=76),
+        Column("Fwd Factor", lambda r: r.fwd_factor, fmt_pct_signed,  width=98, signed=True),
         Column("Debit",      lambda r: r.debit,      fmt_money,       width=68),
-        Column("F-Spread",   lambda r: r.f_spread,   fmt_money,       width=72),
-        Column("B-Spread",   lambda r: r.b_spread,   fmt_money,       width=72),
-        Column("Earnings",   lambda r: r.earnings,   str,             width=92),
+        Column("F-Spread",   lambda r: r.f_spread,   fmt_money,       width=82),
+        Column("B-Spread",   lambda r: r.b_spread,   fmt_money,       width=82),
+        Column("Earnings",   lambda r: r.earnings,   str,             width=96),
     ]
 
     # Columns whose change triggers a green/red flash, by index.
@@ -196,6 +208,11 @@ class ScanResultsModel(_FlashTableModel):
 
     def apply_live_update(self, row: int, price, f_bid, f_ask, b_bid, b_ask, ivs):
         """Write a fresh quote snapshot + solved metrics into one row.
+
+        `ivs` may be None when the snapshot can't support the model (see
+        `solve_calendar`). The quote columns are still written — a fresh bid is
+        worth showing even when the IVs behind it don't solve — and the derived
+        metrics keep their previous values rather than blanking on one bad tick.
 
         Returns True if anything changed, so the controller can decide whether a
         re-sort is warranted.
@@ -215,11 +232,12 @@ class ScanResultsModel(_FlashTableModel):
         r.price = price
         r.f_bid, r.f_ask = f_bid, f_ask
         r.b_bid, r.b_ask = b_bid, b_ask
-        r.front_iv   = ivs.front_iv
-        r.back_iv    = ivs.back_iv
-        r.fwd_iv     = ivs.fwd_iv
-        r.fwd_factor = ivs.fwd_factor
-        r.debit      = ivs.debit
+        if ivs is not None:
+            r.front_iv   = ivs.front_iv
+            r.back_iv    = ivs.back_iv
+            r.fwd_iv     = ivs.fwd_iv
+            r.fwd_factor = ivs.fwd_factor
+            r.debit      = ivs.debit
 
         self.flash_cells(row, flashes)
         self.emit_row_changed(row)
@@ -245,19 +263,19 @@ class PositionsModel(_FlashTableModel):
         Column("F-DTE",     lambda p: p.current_dtes()[0], str,       width=52),
         Column("B-DTE",     lambda p: p.current_dtes()[1], str,       width=52),
         Column("Ctr",       lambda p: p.contracts,     str,           width=42),
-        Column("Front Cr",  lambda p: p.front_credit,  fmt_money,     width=72),
-        Column("Back Pd",   lambda p: p.back_paid,     fmt_money,     width=72),
+        Column("Front Cr",  lambda p: p.front_credit,  fmt_money,     width=78),
+        Column("Back Pd",   lambda p: p.back_paid,     fmt_money,     width=78),
         Column("F-Bid",     lambda p: p.f_bid,         fmt_money,     width=62, flash=True),
         Column("F-Ask",     lambda p: p.f_ask,         fmt_money,     width=62, flash=True),
         Column("B-Bid",     lambda p: p.b_bid,         fmt_money,     width=62, flash=True),
         Column("B-Ask",     lambda p: p.b_ask,         fmt_money,     width=62, flash=True),
-        Column("Front IV",  lambda p: p.front_iv,      fmt_iv,        width=68),
-        Column("Back IV",   lambda p: p.back_iv,       fmt_iv,        width=68),
-        Column("Fwd IV",    lambda p: p.fwd_iv,        fmt_iv,        width=68),
-        Column("Cur FF",    lambda p: p.fwd_factor,    fmt_pct_signed, width=68, signed=True),
-        Column("Open FF",   lambda p: p.opened_fwd_factor, fmt_pct_signed, width=68, signed=True),
-        Column("Cur Debit", lambda p: p.cur_debit,     fmt_money,     width=74),
-        Column("P/L $",     lambda p: p.cur_pl,        fmt_money,     width=78, signed=True),
+        Column("Front IV",  lambda p: p.front_iv,      fmt_iv,        width=76),
+        Column("Back IV",   lambda p: p.back_iv,       fmt_iv,        width=76),
+        Column("Fwd IV",    lambda p: p.fwd_iv,        fmt_iv,        width=76),
+        Column("Cur FF",    lambda p: p.fwd_factor,    fmt_pct_signed, width=76, signed=True),
+        Column("Open FF",   lambda p: p.opened_fwd_factor, fmt_pct_signed, width=80, signed=True),
+        Column("Cur Debit", lambda p: p.cur_debit,     fmt_money,     width=86),
+        Column("P/L $",     lambda p: p.cur_pl,        fmt_money,     width=86, signed=True),
     ]
 
     _FLASH_COLS = {i: c for i, c in enumerate(COLUMNS) if c.flash}

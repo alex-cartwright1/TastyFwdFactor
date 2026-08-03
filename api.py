@@ -40,9 +40,16 @@ _URL_KEYS   = ('dxlink-url', 'websocket-url', 'streamer-url', 'url')
 # Server drops the connection at 60s without a KEEPALIVE; send well inside that.
 KEEPALIVE_MS = 30_000
 
+# DXLink coalesces events over this window before sending them, and the unit is
+# SECONDS. It is a throttle, not a batching hint: at 10 every symbol is capped to
+# one update per 10s, which reads as a frozen quote feed and also starves the
+# scan's one-shot fetch inside its 25s timeout. 0.1 is what Tastytrade's own
+# streamer docs use for real-time data.
+AGGREGATION_PERIOD = 0.1
+
 _FEED_SETUP = {
     "type": "FEED_SETUP", "channel": 1,
-    "acceptAggregationPeriod": 10,
+    "acceptAggregationPeriod": AGGREGATION_PERIOD,
     "acceptDataFormat": "COMPACT",
     "acceptEventFields": {
         "Quote": ["eventSymbol", "bidPrice", "askPrice"],
@@ -171,6 +178,18 @@ def _extract_url(data):
     return ''
 
 
+def _describe_ws_error(error):
+    """Render whatever websocket-client caught as something a user can read.
+
+    A clean server-side close arrives here as a raw ABNF frame whose `str()` is
+    `fin=1 opcode=8 data=b'\\x03\\xe9'` — that must never reach the status badge.
+    """
+    if getattr(error, 'opcode', None) == 8:
+        return "connection closed by server"
+    text = str(error).strip()
+    return text or error.__class__.__name__
+
+
 def _safe_float(val):
     try:
         f = float(val)
@@ -232,10 +251,20 @@ def _parse_feed_data(raw_data, field_map, quotes):
     return touched
 
 
-def _subscription_frame(quote_syms, trade_syms):
+# Symbols per FEED_SUBSCRIPTION frame. A full scan streams every result row at
+# 3 symbols each, so one frame carrying the lot would be needlessly large.
+SUBSCRIBE_CHUNK = 200
+
+
+def _subscription_frames(quote_syms, trade_syms, chunk=SUBSCRIBE_CHUNK):
+    """FEED_SUBSCRIPTION frames covering these symbols, chunked."""
     subs  = [{"type": "Quote", "symbol": s} for s in quote_syms]
     subs += [{"type": "Trade", "symbol": s} for s in trade_syms]
-    return json.dumps({"type": "FEED_SUBSCRIPTION", "channel": 1, "add": subs})
+    return [
+        json.dumps({"type": "FEED_SUBSCRIPTION", "channel": 1,
+                    "add": subs[i:i + chunk]})
+        for i in range(0, len(subs), chunk)
+    ]
 
 
 # ─── One-shot fetch (used by the scan) ───────────────────────────────────────
@@ -331,7 +360,8 @@ def fetch_quotes_dxlink(token_data, symbols, timeout=25):
                 diag['channel_opened'] = True
                 log.debug("CHANNEL_OPENED — sending FEED_SETUP + subscriptions")
                 ws.send(json.dumps(_FEED_SETUP))
-                ws.send(_subscription_frame(symbols, equity_syms))
+                for frame in _subscription_frames(symbols, equity_syms):
+                    ws.send(frame)
                 log.debug(f"Subscribed across {len(symbols)} symbols")
 
             elif mtype == 'FEED_CONFIG' and data.get('channel') == 1:
@@ -486,7 +516,8 @@ class DXLinkLiveClient(QThread):
         self._quotes = {}                # WS-thread-only cache of merged quotes
         self._subscribed_quote = set()
         self._subscribed_trade = set()
-        self._pending = []               # subscriptions requested before FEED_CONFIG
+        self._pending = []               # subscriptions requested before the channel opened
+        self._channel_open = False
         self._sub_mutex = QMutex()
         self._stopping = False
 
@@ -551,9 +582,9 @@ class DXLinkLiveClient(QThread):
                     }))
             elif mtype == 'CHANNEL_OPENED' and data.get('channel') == 1:
                 ws.send(json.dumps(_FEED_SETUP))
+                self._open_channel()
             elif mtype == 'FEED_CONFIG' and data.get('channel') == 1:
                 self._install_field_map(data.get('eventFields', {}))
-                self.ready.emit()
             elif mtype == 'FEED_DATA' and data.get('channel') == 1:
                 touched = _parse_feed_data(data.get('data', []), self._field_map,
                                            self._quotes)
@@ -571,9 +602,9 @@ class DXLinkLiveClient(QThread):
             log.error(f"DXLinkLive on_message exception: {exc}")
 
     def _on_error(self, ws, error):
-        log.error(f"DXLinkLive WS error: {error}")
+        log.error(f"DXLinkLive WS error: {error!r}")
         if not self._stopping:
-            self.connectionFailed.emit(str(error))
+            self.connectionFailed.emit(_describe_ws_error(error))
 
     def _on_close(self, ws, code, msg):
         log.debug(f"DXLinkLive WS closed: code={code}")
@@ -584,9 +615,8 @@ class DXLinkLiveClient(QThread):
         """Subscribe to Quote events for `symbols`, and Trade events for those
         also in `with_trade_for` (typically the equity set).
 
-        Calls made before FEED_CONFIG arrives are queued: `_parse_feed_data`
-        can't decode COMPACT payloads without the field map, so the server must
-        finish negotiating first.
+        Calls made before the feed channel is open are queued and flushed by
+        `_open_channel`.
         """
         if not symbols or self._stopping:
             return
@@ -599,27 +629,51 @@ class DXLinkLiveClient(QThread):
                 return
             self._subscribed_quote.update(new_q)
             self._subscribed_trade.update(new_t)
-            if not self._field_map:
+            if not self._channel_open:
                 self._pending.append((new_q, new_t))
                 return
         self._send_subscription(new_q, new_t)
 
-    def _install_field_map(self, event_fields):
-        """Publish the FEED_CONFIG field map and drain anything that was
-        subscribed before it arrived. Done under the subscription mutex so a
-        concurrent subscribe() either queues (and gets drained here) or sends
-        directly — never both, never neither."""
+    def _open_channel(self):
+        """FEED_SETUP is away, so subscriptions may now be sent; drain the queue.
+
+        Deliberately *not* gated on FEED_CONFIG. The server announces the COMPACT
+        field ordering for an event type only once something is subscribed to that
+        type — the first FEED_CONFIG carries no `eventFields` at all — so waiting
+        for a populated field map before subscribing deadlocks: we wait for fields
+        the server will never send until we subscribe. Decoding stays safe because
+        the populated FEED_CONFIG always precedes the FEED_DATA it describes.
+
+        Draining under the mutex means a concurrent subscribe() either queues (and
+        is flushed here) or sends directly — never both, never neither.
+        """
         with QMutexLocker(self._sub_mutex):
-            for etype, fields in event_fields.items():
-                self._field_map[etype] = fields
+            self._channel_open = True
             pending, self._pending = self._pending, []
-        log.debug(f"DXLinkLive FEED_CONFIG field_map keys: {list(self._field_map.keys())}")
         for new_q, new_t in pending:
             self._send_subscription(new_q, new_t)
+        self.ready.emit()
+
+    def _install_field_map(self, event_fields):
+        """Merge one FEED_CONFIG's field ordering.
+
+        These arrive incrementally — an initial config with no `eventFields`,
+        then one per event type as subscriptions are made — so this merges rather
+        than replaces, and an empty payload is normal rather than a failure.
+        Touched only from the socket thread, so it needs no lock.
+        """
+        if not event_fields:
+            log.debug("DXLinkLive FEED_CONFIG carried no eventFields (expected "
+                      "before the first subscription)")
+            return
+        for etype, fields in event_fields.items():
+            self._field_map[etype] = fields
+        log.debug(f"DXLinkLive FEED_CONFIG field_map keys: {list(self._field_map.keys())}")
 
     def _send_subscription(self, new_q, new_t):
         try:
-            self._ws.send(_subscription_frame(new_q, new_t))
+            for frame in _subscription_frames(new_q, new_t):
+                self._ws.send(frame)
         except Exception as exc:
             log.warning(f"DXLinkLive subscribe failed: {exc}")
             return

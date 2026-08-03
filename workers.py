@@ -57,6 +57,43 @@ class ApiSession(QObject):
             self._api = None
 
 
+class AuthWorker(QThread):
+    """Performs the login OAuth round trip off the GUI thread.
+
+    The exchange takes a second or two against production, which is exactly long
+    enough to freeze a login form — so the window shows a spinner and waits for
+    one of these signals.
+    """
+
+    succeeded = Signal()
+    failed = Signal(str)
+
+    def __init__(self, session: ApiSession, parent=None):
+        super().__init__(parent)
+        self._session = session
+
+    def run(self):
+        try:
+            self._session.ensure()
+        except Exception as exc:
+            log.warning(f"Authentication failed: {exc}")
+            self.failed.emit(_friendly_auth_error(exc))
+            return
+        self.succeeded.emit()
+
+
+def _friendly_auth_error(exc):
+    """Turn an OAuth/transport failure into something a trader can act on."""
+    text = str(exc)
+    if "401" in text or "invalid_grant" in text or "invalid" in text.lower():
+        return ("Tastytrade rejected these credentials. Check the client secret "
+                "and refresh token, and that the grant hasn't been revoked.")
+    if any(word in text.lower() for word in ("timed out", "timeout", "connection",
+                                             "resolve", "network", "ssl")):
+        return "Could not reach api.tastyworks.com. Check your connection."
+    return text[:300]
+
+
 class ScanWorker(QThread):
     """Runs the whole scan pipeline off the GUI thread.
 

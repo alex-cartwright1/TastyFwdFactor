@@ -12,19 +12,35 @@ from PySide6.QtWidgets import (
 
 from config import IV_METHODS, clear_ticker_cache, save_settings
 from data_models import Position
+from theme import T, shadow
 
 
 def _hint(text):
     label = QLabel(text)
     label.setWordWrap(True)
-    label.setStyleSheet("color: #888; font-size: 10px;")
+    label.setProperty("role", "hint")
     return label
 
 
 def _section(text):
-    label = QLabel(text)
-    label.setStyleSheet("font-weight: 600;")
+    label = QLabel(text.upper())
+    label.setProperty("role", "section")
     return label
+
+
+def _title(text, subtitle=None):
+    """Dialog heading block."""
+    box = QVBoxLayout()
+    box.setSpacing(2)
+    heading = QLabel(text)
+    heading.setProperty("role", "title")
+    box.addWidget(heading)
+    if subtitle:
+        sub = QLabel(subtitle)
+        sub.setProperty("role", "subtitle")
+        sub.setWordWrap(True)
+        box.addWidget(sub)
+    return box
 
 
 class FiltersDialog(QDialog):
@@ -33,10 +49,15 @@ class FiltersDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Filters & Scan Settings")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(520)
         self._settings = dict(settings)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(10)
+        root.addLayout(_title("Scan settings",
+                              "Applied on the next run. Saved to settings.json."))
+        root.addSpacing(6)
         root.addWidget(_section("Scan Parameters"))
 
         form = QFormLayout()
@@ -114,8 +135,12 @@ class FiltersDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save |
                                    QDialogButtonBox.StandardButton.Cancel)
+        save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        save_btn.setProperty("variant", "primary")
+        save_btn.setMinimumWidth(96)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
+        root.addSpacing(6)
         root.addWidget(buttons)
 
     # ── helpers ──
@@ -211,11 +236,20 @@ class PositionDialog(QDialog):
     def __init__(self, existing: Position = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Edit Position" if existing else "Add Position")
+        self.setMinimumWidth(420)
         self._existing = existing
         self._result = None
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(12)
+        root.addLayout(_title(
+            "Edit position" if existing else "Add position",
+            "Tracked against live quotes once the legs resolve in the chain."))
+
         form = QFormLayout()
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         root.addLayout(form)
 
         e = existing
@@ -247,10 +281,13 @@ class PositionDialog(QDialog):
             "strike must match a listed strike. Credits are per-share "
             "(e.g. 1.50 means $150 per contract)."))
 
-        buttons = QDialogButtonBox(
-            (QDialogButtonBox.StandardButton.Save if existing
-             else QDialogButtonBox.StandardButton.Ok) |
-            QDialogButtonBox.StandardButton.Cancel)
+        primary = (QDialogButtonBox.StandardButton.Save if existing
+                   else QDialogButtonBox.StandardButton.Ok)
+        buttons = QDialogButtonBox(primary | QDialogButtonBox.StandardButton.Cancel)
+        confirm = buttons.button(primary)
+        confirm.setProperty("variant", "primary")
+        confirm.setText("Save" if existing else "Add position")
+        confirm.setMinimumWidth(110)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
