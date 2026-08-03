@@ -2,7 +2,7 @@
 
 **Website:** [tastyfwdfactor.cch-uk.tech](https://tastyfwdfactor.cch-uk.tech)
 
-A Tkinter GUI that scans a watchlist for calendar spread setups, and ranks them by forward factor. Also allows you to analyse individual trades with a real-time P/L chart, and track open positions with live P/L.
+A PySide6 (Qt) desktop app that scans a watchlist for calendar spread setups, and ranks them by forward factor. Also allows you to analyse individual trades with a real-time P/L chart, and track open positions with live P/L.
 
 **Data sources:** Tastytrade API using DXLINK (option chains + quotes) and yfinance (earnings dates, market cap, dividend dates).
 
@@ -27,24 +27,22 @@ cd TastyFwdFactor
 ### 2. Install Python dependencies
 
 ```bash
-pip install requests scipy numpy websocket-client pandas yfinance matplotlib keyring
+pip install -r requirements.txt
 ```
 
-`tkinter` ships with Python on Windows and macOS. On Linux you may need:
+PySide6 ships its own Qt libraries, so there is no system Qt to install. On a
+headless or minimal Linux box you may still need the usual X/XCB runtime
+libraries:
 
 ```bash
 # Debian / Ubuntu
-sudo apt install python3-tk
-
-# Fedora / RHEL
-sudo dnf install python3-tkinter
+sudo apt install libgl1 libxkbcommon-x11-0 libegl1
 ```
 
 **Optional but recommended:**
 
 | Package | Purpose |
 |---|---|
-| `matplotlib` | Interactive P/L chart — disabled gracefully if missing |
 | `keyring` | Stores credentials in OS secret store instead of a JSON file |
 
 > **Linux / WSL note:** `keyring` requires a running secret service (GNOME Keyring, KWallet). Without one the app falls back to `~/.config/calendar-spread/credentials.json` (mode 600) automatically. To get keyring working on WSL2, install `keyrings.cryptfile` as an alternative: `pip install keyrings.cryptfile`.
@@ -220,5 +218,6 @@ DXLink quote tokens expire. The app fetches a fresh token before each scan. If t
 - Relax the earnings / market cap / price filters in **Filters & Scan Settings…**.
 - Open the **Debug Log** tab to see per-ticker rejection reasons.
 
-**`No module named 'tkinter'`**
-Install the system `python3-tk` package (see [Installation](#installation) above).
+**`qt.qpa.plugin: Could not load the Qt platform plugin "xcb"`**
+Install the X/XCB runtime libraries listed under [Installation](#installation).
+Re-run with `QT_DEBUG_PLUGINS=1` to see exactly which shared object is missing.

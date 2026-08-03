@@ -1,0 +1,573 @@
+"""The scan pipeline: watchlist → ticker info → chains → quotes → metrics.
+
+Pure logic — no Qt widgets, no global state. Progress is reported through a
+`reporter` duck type supplying `status(msg)`, `progress(pct)`,
+`indeterminate(on)` and `cancelled()`, which the worker implements as signal
+emissions.
+
+The phase ordering is a cost optimisation and must not be reordered:
+
+1. Ticker info (yfinance, concurrent, disk-cached with TTL) → pre-filter on
+   market cap / earnings / ex-div, so excluded tickers never trigger a chain
+   request. The pre-filter uses the *target* DTEs minus a 7-day safety buffer
+   because the actual expiry is not yet known.
+2. Option chains for survivors only, then a post-filter that re-checks
+   earnings/dividends against the *actual* front/back expiry dates.
+3. Equity quotes via DXLink → pick the ATM strike → option quotes via DXLink.
+4. Metrics.
+"""
+
+import os
+import random
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+import yfinance as yf
+
+from api import describe_diags, fetch_quotes_with_retry
+from applog import log
+from config import load_ticker_cache, parse_iso_date, save_ticker_cache
+from data_models import ChainInfo, Quote, ScanResult
+from pricing import solve_calendar
+from qtpool import parallel_map
+
+FALLBACK_TICKERS = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'IWM', 'AMD']
+
+
+class ScanAborted(Exception):
+    """Raised to unwind the pipeline when the user cancels or a phase yields
+    nothing usable. The message is shown as the final status."""
+
+
+class _NullReporter:
+    def status(self, msg):        log.info(msg)
+    def progress(self, pct):      pass
+    def indeterminate(self, on):  pass
+    def cancelled(self):          return False
+
+
+# ─── Watchlist ───────────────────────────────────────────────────────────────
+
+def load_watchlist(path):
+    """Lenient CSV parse: first comma-separated field of each non-empty line,
+    uppercased. A header row is optional — any line starting with 'ticker' is
+    skipped."""
+    if not os.path.exists(path):
+        log.warning(f"CSV not found: {path}")
+        return list(FALLBACK_TICKERS), False
+    with open(path, 'r') as fh:
+        tickers = [
+            line.strip().split(',')[0].upper()
+            for line in fh
+            if line.strip() and not line.lower().startswith('ticker')
+        ]
+    log.info(f"Loaded {len(tickers)} tickers from {path}")
+    return tickers, True
+
+
+# ─── yfinance: earnings / market cap / ex-dividend ───────────────────────────
+
+def _calendar_dates(cal, key):
+    """Pull a list of dates out of a yfinance calendar (handles dict / DataFrame)."""
+    if cal is None:
+        return []
+    try:
+        if hasattr(cal, 'loc') and hasattr(cal, 'index'):
+            return cal.loc[key].tolist() if key in cal.index else []
+        return cal.get(key, []) or []
+    except Exception:
+        return []
+
+
+def _next_future_date(candidates, today):
+    """First date in candidates that is >= today; returns date or None."""
+    if not isinstance(candidates, (list, tuple)):
+        candidates = [candidates]
+    for d in candidates:
+        if hasattr(d, 'date'):
+            d = d.date()
+        elif isinstance(d, (int, float)):
+            try:
+                d = datetime.fromtimestamp(d).date()
+            except (ValueError, OSError):
+                continue
+        if hasattr(d, 'year') and d >= today:
+            return d
+    return None
+
+
+@dataclass
+class TickerInfo:
+    earnings:   object = None      # datetime.date | None
+    market_cap: object = None      # float | None
+    ex_div:     object = None      # datetime.date | None
+
+
+def _fetch_single_ticker_info(symbol):
+    today = datetime.today().date()
+    info_out = TickerInfo()
+    try:
+        t    = yf.Ticker(symbol)
+        cal  = t.calendar
+        info = t.info
+        info_out.market_cap = info.get('marketCap')
+
+        # Earnings: prefer calendar, fall back to info
+        earnings = _next_future_date(_calendar_dates(cal, 'Earnings Date'), today)
+        if earnings is None:
+            ed = info.get('earningsDate') or info.get('earningsTimestamps')
+            earnings = _next_future_date(ed, today)
+        info_out.earnings = earnings
+
+        # Ex-dividend: same approach. info['exDividendDate'] is a unix timestamp
+        # of the *most recent* ex-div in many versions of yfinance, so filter by
+        # today before accepting it.
+        ex_div = _next_future_date(_calendar_dates(cal, 'Ex-Dividend Date'), today)
+        if ex_div is None:
+            ex_div = _next_future_date(info.get('exDividendDate'), today)
+        info_out.ex_div = ex_div
+    except Exception:
+        pass
+    return info_out
+
+
+def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
+                      ttl_days=7, force_refresh=False, should_cancel=None):
+    """Concurrent yfinance fetch backed by an on-disk cache.
+
+    Cached entries younger than `ttl_days` are reused without scraping. Entries
+    whose cached earnings/ex-div date has already passed are re-fetched, since
+    yfinance may have rolled forward to the next event.
+
+    Returns ``{symbol: TickerInfo}``.
+    """
+    cache    = {} if force_refresh else load_ticker_cache()
+    today    = datetime.today().date()
+    fetched_at = time.time()
+    ttl_secs = max(ttl_days, 0) * 86400
+
+    out, to_fetch = {}, []
+    for sym in symbols:
+        entry = cache.get(sym)
+        if entry and ttl_secs > 0 and (fetched_at - entry.get('fetched_at', 0)) < ttl_secs:
+            ed = parse_iso_date(entry.get('earnings'))
+            xd = parse_iso_date(entry.get('ex_div'))
+            if (ed and ed < today) or (xd and xd < today):
+                to_fetch.append(sym)
+                continue
+            out[sym] = TickerInfo(ed, entry.get('market_cap'), xd)
+        else:
+            to_fetch.append(sym)
+
+    n_cached = len(symbols) - len(to_fetch)
+    if to_fetch:
+        log.info(f"Ticker info: {n_cached} from cache, {len(to_fetch)} to scrape")
+    else:
+        log.info(f"Ticker info: all {n_cached} from cache")
+        if progress_cb:
+            progress_cb(len(symbols), len(symbols))
+        return out
+
+    def _report(done, _total):
+        if progress_cb:
+            progress_cb(n_cached + done, len(symbols))
+
+    for sym, info in parallel_map(_fetch_single_ticker_info, to_fetch,
+                                  max_workers=max_workers, progress_cb=_report,
+                                  should_cancel=should_cancel):
+        if isinstance(info, Exception):
+            log.debug(f"Ticker info {sym} failed: {info}")
+            info = TickerInfo()
+        out[sym] = info
+        cache[sym] = {
+            'earnings':   info.earnings.isoformat() if info.earnings else None,
+            'market_cap': info.market_cap,
+            'ex_div':     info.ex_div.isoformat() if info.ex_div else None,
+            'fetched_at': fetched_at,
+        }
+
+    save_ticker_cache(cache)
+    return out
+
+
+# ─── Option chain structure ──────────────────────────────────────────────────
+
+def get_chain_info(symbol, api, target_front_dte, target_back_dte,
+                   front_dte_flex=0, back_dte_flex=0) -> ChainInfo:
+    """Pick the front/back expirations for one symbol.
+
+    Always returns a ChainInfo; a rejection carries `skip_reason` rather than
+    raising, so the scan can aggregate rejection counts for the log.
+
+    `front_dte_flex` / `back_dte_flex`: tolerance window (days) around the
+    target DTE. With flex>0 only expirations whose DTE falls within
+    [target-flex, target+flex] are eligible; the nearest match in that window is
+    picked. With flex==0 the "nearest match across all expirations" behaviour is
+    used.
+    """
+    time.sleep(random.uniform(0.05, 0.15))
+    today = datetime.today()
+    try:
+        chain_data = api.get_option_chain(symbol)
+        if not chain_data:
+            return ChainInfo(symbol, skip_reason='no_chain_data')
+
+        expirations = chain_data[0].get('expirations', [])
+        if len(expirations) < 2:
+            return ChainInfo(symbol, skip_reason=f'too_few_expirations:{len(expirations)}')
+
+        exp_dates = [datetime.strptime(e['expiration-date'], '%Y-%m-%d') for e in expirations]
+        dtes      = [(d - today).days for d in exp_dates]
+
+        def pick(target, flex):
+            """Index of the best expiration, or None if flex excludes them all."""
+            if flex > 0:
+                cands = [i for i, d in enumerate(dtes)
+                         if d > 0 and abs(d - target) <= flex]
+                if not cands:
+                    return None
+                return min(cands, key=lambda i: abs(dtes[i] - target))
+            return min(range(len(dtes)), key=lambda i: abs(dtes[i] - target))
+
+        front_idx = pick(target_front_dte, front_dte_flex)
+        if front_idx is None:
+            return ChainInfo(
+                symbol,
+                skip_reason=f'no_front_in_flex:{target_front_dte}±{front_dte_flex}')
+        back_idx = pick(target_back_dte, back_dte_flex)
+        if back_idx is None:
+            return ChainInfo(
+                symbol,
+                skip_reason=f'no_back_in_flex:{target_back_dte}±{back_dte_flex}')
+
+        if dtes[front_idx] <= 0:
+            return ChainInfo(symbol, skip_reason=f'all_expired:max_dte={max(dtes)}')
+        if back_idx <= front_idx:
+            return ChainInfo(
+                symbol,
+                skip_reason=f'back_not_after_front:f={dtes[front_idx]},b={dtes[back_idx]}')
+
+        # Restrict strikes to those present in BOTH expirations so any later ATM
+        # pick is guaranteed to have a matching back-leg contract.
+        front_raw = expirations[front_idx]['strikes']
+        back_raw  = expirations[back_idx]['strikes']
+        common = ({s.get('strike-price') for s in front_raw}
+                  & {s.get('strike-price') for s in back_raw})
+        if not common:
+            return ChainInfo(symbol, skip_reason='no_common_strikes')
+
+        return ChainInfo(
+            ticker         = symbol,
+            front_dte      = dtes[front_idx],
+            back_dte       = dtes[back_idx],
+            front_exp_date = exp_dates[front_idx].date(),
+            back_exp_date  = exp_dates[back_idx].date(),
+            front_strikes  = [s for s in front_raw if s.get('strike-price') in common],
+            back_strikes   = [s for s in back_raw  if s.get('strike-price') in common],
+        )
+    except Exception as exc:
+        return ChainInfo(symbol, skip_reason=f'exception:{exc}')
+
+
+def _streamer_symbol(strike_entry):
+    return strike_entry.get('call-streamer-symbol') or strike_entry.get('call', '')
+
+
+def resolve_position_legs(api, ticker, strike, front_expiry, back_expiry):
+    """Look up call-streamer-symbols + DTEs for a manually entered position.
+
+    Raises ValueError with a human-readable message if the chain doesn't contain
+    a matching expiration or strike.
+    """
+    chain_data = api.get_option_chain(ticker)
+    if not chain_data:
+        raise ValueError(f"No option chain returned for {ticker}")
+
+    by_date = {e.get('expiration-date'): e
+               for e in chain_data[0].get('expirations', [])}
+    for label, exp in (('front', front_expiry), ('back', back_expiry)):
+        if exp not in by_date:
+            raise ValueError(f"{ticker}: no {label} expiration {exp} in chain")
+
+    today  = datetime.today().date()
+    f_date = datetime.strptime(front_expiry, '%Y-%m-%d').date()
+    b_date = datetime.strptime(back_expiry,  '%Y-%m-%d').date()
+
+    def find_strike(exp_entry, label):
+        for s in exp_entry.get('strikes', []):
+            try:
+                if abs(float(s.get('strike-price', 0)) - float(strike)) < 1e-6:
+                    return s
+            except (TypeError, ValueError):
+                continue
+        raise ValueError(
+            f"{ticker}: no {label} strike {strike} on {exp_entry.get('expiration-date')}")
+
+    front_sym = _streamer_symbol(find_strike(by_date[front_expiry], 'front'))
+    back_sym  = _streamer_symbol(find_strike(by_date[back_expiry],  'back'))
+    if not front_sym or not back_sym:
+        raise ValueError(f"{ticker}: missing call-streamer-symbol on chain entry")
+
+    return {
+        'front_streamer_symbol': front_sym,
+        'back_streamer_symbol':  back_sym,
+        'front_dte': max((f_date - today).days, 0),
+        'back_dte':  max((b_date - today).days, 0),
+    }
+
+
+# ─── Metrics ─────────────────────────────────────────────────────────────────
+
+def calculate_calendar_metrics(chain: ChainInfo, option_quotes, iv_method):
+    """Build a ScanResult from a ChainInfo plus a DXLink quote snapshot, or None
+    if the quotes can't support the model."""
+    if not chain.front_sym or not chain.back_sym or chain.strike <= 0:
+        return None
+
+    fq = option_quotes.get(chain.front_sym, Quote())
+    bq = option_quotes.get(chain.back_sym,  Quote())
+
+    ivs = solve_calendar(chain.current_price, chain.strike,
+                         chain.front_dte, chain.back_dte,
+                         fq.bid, fq.ask, bq.bid, bq.ask, iv_method)
+    if ivs is None:
+        return None
+
+    return ScanResult(
+        ticker     = chain.ticker,
+        price      = chain.current_price,
+        market_cap = chain.market_cap,
+        strike     = chain.strike,
+        front_dte  = chain.front_dte,
+        back_dte   = chain.back_dte,
+        f_bid      = fq.bid, f_ask = fq.ask,
+        b_bid      = bq.bid, b_ask = bq.ask,
+        front_iv   = ivs.front_iv,
+        back_iv    = ivs.back_iv,
+        fwd_iv     = ivs.fwd_iv,
+        fwd_factor = ivs.fwd_factor,
+        debit      = ivs.debit,
+        earnings   = chain.earnings_date.strftime('%Y-%m-%d') if chain.earnings_date else 'N/A',
+        front_sym  = chain.front_sym,
+        back_sym   = chain.back_sym,
+    )
+
+
+# ─── Pipeline ────────────────────────────────────────────────────────────────
+
+def run_scan(api, settings, reporter=None):
+    """Execute the full scan. Returns a list of ScanResult sorted by fwd factor.
+
+    Raises ScanAborted with a user-facing message when a phase leaves nothing to
+    work with.
+    """
+    rep = reporter or _NullReporter()
+
+    def check_cancel():
+        if rep.cancelled():
+            raise ScanAborted("Scan cancelled.")
+
+    f_dte  = int(settings['front_dte'])
+    b_dte  = int(settings['back_dte'])
+    f_flex = int(settings.get('front_dte_flex', 0) or 0)
+    b_flex = int(settings.get('back_dte_flex', 0) or 0)
+    iv_method = settings['iv_method']
+    min_price = float(settings['min_price'])
+    ttl_days  = int(settings.get('ticker_info_ttl_days', 7))
+
+    filter_f_earn  = settings['filter_front_earnings']
+    filter_b_earn  = settings['filter_back_earnings']
+    filter_f_div   = settings['filter_front_dividend']
+    filter_b_div   = settings['filter_back_dividend']
+    filter_no_earn = settings.get('filter_unknown_earnings', False)
+
+    cap_str = settings['min_market_cap_b']
+    cap_str = cap_str.strip() if isinstance(cap_str, str) else ''
+    try:
+        min_cap = float(cap_str) * 1e9 if cap_str else 0.0
+    except ValueError:
+        min_cap = 0.0
+
+    tickers, found = load_watchlist(settings['csv_path'])
+    if not found:
+        rep.status(f"'{settings['csv_path']}' not found — using fallback list.")
+    total = len(tickers)
+
+    # ── Phase 1: ticker info + pre-filter ────────────────────────────────────
+    rep.status(f"Phase 1/4: Ticker info ({total} tickers, cache TTL={ttl_days}d)…")
+    rep.progress(0)
+    log.info(f"Phase 1: ticker info fetch ({total} tickers, ttl={ttl_days}d)")
+
+    def _ep(done, tot):
+        rep.progress(int(done / tot * 20))
+        rep.status(f"Phase 1/4: Ticker info {done}/{tot}…")
+
+    info_map = fetch_ticker_info(tickers, progress_cb=_ep, ttl_days=ttl_days,
+                                 should_cancel=rep.cancelled)
+    check_cancel()
+
+    # Conservative pre-filter cutoffs: the actual front/back expirations may
+    # differ from the user's targets by a few days, so use a 7-day safety buffer
+    # and drop only tickers whose earnings/ex-div falls well before the earliest
+    # possible expiry. Boundary cases are caught again post-chain.
+    today  = datetime.today().date()
+    safety = timedelta(days=7)
+    front_pre_cut = today + timedelta(days=f_dte) - safety
+    back_pre_cut  = today + timedelta(days=b_dte) - safety
+
+    survivors = []
+    dropped_cap = dropped_earn = dropped_div = dropped_no_earn = 0
+    for t in tickers:
+        info = info_map.get(t) or TickerInfo()
+        if min_cap > 0 and (info.market_cap is None or info.market_cap < min_cap):
+            dropped_cap += 1
+            continue
+        if filter_no_earn and info.earnings is None:
+            dropped_no_earn += 1
+            continue
+        if info.earnings and ((filter_f_earn and info.earnings <= front_pre_cut) or
+                              (filter_b_earn and info.earnings <= back_pre_cut)):
+            dropped_earn += 1
+            continue
+        if info.ex_div and ((filter_f_div and info.ex_div <= front_pre_cut) or
+                            (filter_b_div and info.ex_div <= back_pre_cut)):
+            dropped_div += 1
+            continue
+        survivors.append(t)
+
+    n_dropped = dropped_cap + dropped_earn + dropped_div + dropped_no_earn
+    if n_dropped:
+        log.info(f"Pre-filter dropped: market_cap={dropped_cap} earnings={dropped_earn} "
+                 f"dividend={dropped_div} no_earnings_date={dropped_no_earn}; "
+                 f"{len(survivors)}/{total} remain")
+        rep.status(f"Pre-filter dropped {n_dropped}; "
+                   f"{len(survivors)} remain — fetching chains…")
+
+    if not survivors:
+        raise ScanAborted("All tickers excluded by pre-filter.")
+
+    # ── Phase 2: option chains (survivors only) + post-filter ────────────────
+    rep.status(f"Phase 2/4: Fetching option chains ({len(survivors)} tickers)…")
+    rep.progress(20)
+    log.info(f"Phase 2: chain fetch for {len(survivors)} survivors  "
+             f"front_dte={f_dte}±{f_flex}  back_dte={b_dte}±{b_flex}")
+
+    def _fetch_chain(sym):
+        return get_chain_info(sym, api, f_dte, b_dte, f_flex, b_flex)
+
+    def _cp(done, tot):
+        if done % 10 == 0 or done == tot:
+            rep.progress(20 + int(done / tot * 30))
+
+    chains, skip_reasons = {}, {}
+    for sym, chain in parallel_map(_fetch_chain, survivors, max_workers=10,
+                                   progress_cb=_cp, should_cancel=rep.cancelled):
+        if isinstance(chain, Exception):
+            chain = ChainInfo(sym, skip_reason=f'exception:{chain}')
+        if chain.ok:
+            chains[chain.ticker] = chain
+        else:
+            key = chain.skip_reason.split(':')[0]
+            skip_reasons[key] = skip_reasons.get(key, 0) + 1
+
+    check_cancel()
+    log.info(f"Phase 2 done: {len(chains)} valid, skips={skip_reasons}")
+    if not chains:
+        reasons = ', '.join(f'{k}:{v}' for k, v in sorted(skip_reasons.items()))
+        raise ScanAborted(f"No valid option chains found. Reasons: {reasons or 'unknown'}")
+
+    for ticker, chain in chains.items():
+        info = info_map.get(ticker) or TickerInfo()
+        chain.earnings_date = info.earnings
+        chain.market_cap    = info.market_cap
+        chain.ex_div_date   = info.ex_div
+
+    # Post-filter against the ACTUAL expirations — the pre-filter used target
+    # DTEs plus a safety buffer, so edge cases can slip through to here.
+    def post_filter(pred, label):
+        removed = [t for t, c in chains.items() if pred(c)]
+        for t in removed:
+            del chains[t]
+        if removed:
+            log.info(f"{label} post-filter removed {len(removed)}; {len(chains)} remain")
+
+    if filter_f_earn or filter_b_earn:
+        post_filter(lambda c: c.earnings_date and (
+            (filter_f_earn and c.earnings_date <= c.front_exp_date) or
+            (filter_b_earn and c.earnings_date <= c.back_exp_date)), "Earnings")
+    if filter_f_div or filter_b_div:
+        post_filter(lambda c: c.ex_div_date and (
+            (filter_f_div and c.ex_div_date <= c.front_exp_date) or
+            (filter_b_div and c.ex_div_date <= c.back_exp_date)), "Dividend")
+
+    if not chains:
+        raise ScanAborted("All tickers filtered out.")
+
+    # ── Phase 3a: equity quotes → ATM strikes ────────────────────────────────
+    equity_syms = list(chains.keys())
+    rep.status(f"Phase 3/4: Equity quotes ({len(equity_syms)} symbols)…")
+    rep.indeterminate(True)
+    log.info(f"Phase 3a: {len(equity_syms)} equity symbols")
+
+    eq_quotes, eq_diags = fetch_quotes_with_retry(api, equity_syms, timeout=25)
+    rep.indeterminate(False)
+    check_cancel()
+
+    n_priced = sum(1 for t in equity_syms if eq_quotes.get(t, Quote()).price > 0)
+    log.info(f"Equity quotes: {n_priced}/{len(equity_syms)} priced")
+    rep.status(f"Equity quotes: {n_priced}/{len(equity_syms)} priced — finding ATM strikes…")
+
+    option_syms = set()
+    for chain in chains.values():
+        price = eq_quotes.get(chain.ticker, Quote()).price
+        if price <= 0:
+            continue
+        chain.current_price = price
+
+        front_atm = min(chain.front_strikes,
+                        key=lambda s: abs(float(s['strike-price']) - price))
+        # Strikes were already restricted to the front/back intersection in
+        # get_chain_info, so this exact-string lookup is guaranteed to match.
+        back_atm = next((s for s in chain.back_strikes
+                         if s['strike-price'] == front_atm['strike-price']), None)
+        if back_atm is None:
+            continue
+
+        chain.front_sym = _streamer_symbol(front_atm)
+        chain.back_sym  = _streamer_symbol(back_atm)
+        chain.strike    = float(front_atm['strike-price'])
+        option_syms.update(s for s in (chain.front_sym, chain.back_sym) if s)
+
+    if not option_syms:
+        raise ScanAborted(
+            f"No equity prices from DXLink ({describe_diags(eq_diags)}). See Debug Log.")
+
+    # ── Phase 3b: option quotes ──────────────────────────────────────────────
+    rep.status(f"Phase 3/4: Option quotes ({len(option_syms)} contracts)…")
+    rep.indeterminate(True)
+    log.info(f"Phase 3b: {len(option_syms)} option symbols")
+
+    opt_quotes, _ = fetch_quotes_with_retry(api, list(option_syms), timeout=30)
+    rep.indeterminate(False)
+    check_cancel()
+
+    n_opt = sum(1 for s in option_syms if opt_quotes.get(s, Quote()).bid > 0)
+    log.info(f"Option quotes: {n_opt}/{len(option_syms)} priced")
+
+    # ── Phase 4: metrics ─────────────────────────────────────────────────────
+    rep.status("Phase 4/4: Calculating calendar spread metrics…")
+    rep.progress(85)
+    log.info("Phase 4: calculating metrics")
+
+    results = []
+    for chain in chains.values():
+        if chain.current_price < min_price:
+            continue
+        r = calculate_calendar_metrics(chain, opt_quotes, iv_method)
+        if r:
+            results.append(r)
+
+    results.sort(key=lambda r: r.fwd_factor, reverse=True)
+    log.info(f"Scan complete: {len(results)} setups found")
+    return results
