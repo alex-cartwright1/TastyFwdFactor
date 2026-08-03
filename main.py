@@ -340,7 +340,7 @@ class TastytradeAPI:
                 log.info("Access token near/past expiry — refreshing")
                 self._refresh_access_token()
 
-    def get_option_chain(self, symbol, retries=3, timeout=30):
+    def get_option_chain(self, symbol, retries=5, timeout=30):
         self._ensure_access_token()
         url = f"{self.BASE}/option-chains/{symbol}/nested"
         for attempt in range(retries):
@@ -349,15 +349,24 @@ class TastytradeAPI:
                 if r.status_code == 200:
                     return r.json()['data']['items']
                 log.debug(f"Chain {symbol}: HTTP {r.status_code} (attempt {attempt+1}) — {r.text[:120]}")
-                # Retry on transient server errors; give up on client errors
-                if r.status_code < 500:
+                # Retry on rate limiting (429) and transient server errors;
+                # give up on other client errors (404, 401, etc).
+                if r.status_code != 429 and r.status_code < 500:
                     break
                 if attempt < retries - 1:
-                    time.sleep(2 ** attempt)   # 1 s, 2 s backoff
+                    # Honor Retry-After if the API sends one; otherwise back off
+                    # exponentially. Jitter desyncs the 10-worker pool so retries
+                    # don't all land on the same instant and re-trip the limit.
+                    retry_after = r.headers.get('Retry-After')
+                    try:
+                        delay = float(retry_after) if retry_after is not None else 2 ** attempt
+                    except ValueError:
+                        delay = 2 ** attempt
+                    time.sleep(delay + random.uniform(0, 0.5))
             except Exception as exc:
                 log.debug(f"Chain {symbol} error (attempt {attempt+1}): {exc}")
                 if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2 ** attempt + random.uniform(0, 0.5))
         return []
 
     def get_quote_token(self):
