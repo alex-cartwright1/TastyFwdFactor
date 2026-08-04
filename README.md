@@ -1,4 +1,4 @@
-# Calendar Spread Edge Screener
+# TastyFwdFactor
 
 **Website:** [tastyfwdfactor.cch-uk.tech](https://tastyfwdfactor.cch-uk.tech)
 
@@ -24,7 +24,14 @@ git clone https://github.com/alex-cartwright1/TastyFwdFactor.git
 cd TastyFwdFactor
 ```
 
-### 2. Install Python dependencies
+### 2. Create a virtual environment (recommended)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+```
+
+### 3. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -53,7 +60,7 @@ sudo apt install fonts-inter
 
 > **Linux / WSL note:** `keyring` requires a running secret service (GNOME Keyring, KWallet). Without one the app falls back to `~/.config/calendar-spread/credentials.json` (mode 600) automatically. To get keyring working on WSL2, install `keyrings.cryptfile` as an alternative: `pip install keyrings.cryptfile`.
 
-### 3. Prepare a watchlist CSV
+### 4. Prepare a watchlist CSV
 
 The app expects a CSV file with a `TICKER` header in the first column. I have included a list of tickers with options traded on the CBOE (around ~5000) called full.csv. By default the script will use these, however feel free to use any list you want, provided it is in the below format:  
 

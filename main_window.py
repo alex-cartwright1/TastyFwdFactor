@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, session: ApiSession):
         super().__init__()
-        self.setWindowTitle("Calendar Spread Edge Screener")
+        self.setWindowTitle("TastyFwdFactor")
         self.resize(1580, 920)
         self.setMinimumSize(1100, 700)
 
@@ -214,7 +214,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
 
-        log.info("Calendar Spread Scanner started")
+        log.info("TastyFwdFactor started")
         log.info(f"Log file: {LOG_PATH}")
         if not KEYRING_AVAILABLE:
             log.warning("'keyring' is not installed — credentials will fall back "
