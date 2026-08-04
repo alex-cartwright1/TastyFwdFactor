@@ -1,4 +1,4 @@
-"""Calendar Spread Edge Screener — Tastytrade production.
+"""TastyFwdFactor — Tastytrade production.
 
 Entry point. Everything else lives in:
 
@@ -35,7 +35,7 @@ def main():
     # Reuse an existing instance so the app can also be driven from a harness
     # that owns the QApplication (headless smoke tests, embedding).
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setApplicationName("Calendar Spread Edge Screener")
+    app.setApplicationName("TastyFwdFactor")
     app.setOrganizationName("calendar-spread")
     apply_theme(app)
 

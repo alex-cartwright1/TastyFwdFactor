@@ -32,7 +32,7 @@ class LoginWindow(QDialog):
 
     def __init__(self, session: ApiSession = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Sign in — Calendar Spread Edge Screener")
+        self.setWindowTitle("Sign in — TastyFwdFactor")
         self.setModal(True)
         self.setFixedSize(880, 560)
 
@@ -67,7 +67,7 @@ class LoginWindow(QDialog):
         box.addWidget(logo)
         box.addSpacing(6)
 
-        title = QLabel("Calendar Spread\nEdge Screener")
+        title = QLabel("TastyFwdFactor")
         title.setProperty("role", "title")
         title.setStyleSheet("font-size: 26px; font-weight: 600; line-height: 130%;")
         box.addWidget(title)
