@@ -1,7 +1,7 @@
 """Persistent user state.
 
 Everything lives in ``~/.config/calendar-spread/``: ``settings.json`` (scan
-params/filters), ``ticker_info.json`` (yfinance cache), ``positions.json``, and
+params/filters), ``ticker_info.json`` (Tastytrade market-metrics cache), ``positions.json``, and
 — only when no OS keyring backend is available — a mode-600 ``credentials.json``
 fallback.
 

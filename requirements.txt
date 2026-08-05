@@ -4,6 +4,6 @@ requests
 scipy
 numpy
 websocket-client
-pandas
-yfinance
+tastytrade
+tzdata
 keyring

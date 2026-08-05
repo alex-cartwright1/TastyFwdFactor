@@ -188,7 +188,7 @@ class FiltersDialog(QDialog):
         clear_ticker_cache()
         QMessageBox.information(
             self, "Cache cleared",
-            "Ticker info cache cleared. The next scan will re-scrape earnings, "
+            "Ticker info cache cleared. The next scan will refetch earnings, "
             "dividends and market caps for all tickers.")
 
     # ── result ──

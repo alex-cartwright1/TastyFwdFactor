@@ -2,6 +2,17 @@
 
 Read-only: nothing here places orders.
 
+Three Tastytrade clients live in this module:
+
+* :class:`TastytradeAPI` — the hand-rolled ``requests`` client used for option
+  chains and quote tokens.
+* :class:`MarketDataSession` — the official ``tastytrade`` SDK, which is async
+  (httpx + asyncio). It supplies the reference data the app used to scrape from
+  yfinance: market cap, earnings dates, ex-dividend dates and the equity market
+  calendar. It owns a private asyncio loop on its own thread so callers get a
+  plain blocking API and the GUI thread never sees a coroutine.
+* the DXLink feed below, unchanged — streaming quotes still come from DXLink.
+
 Two DXLink consumers live in this module:
 
 * :func:`fetch_quotes_with_retry` — a one-shot batched fetch used by the scan.
@@ -15,10 +26,12 @@ Handshake for both:
 ``FEED_CONFIG`` → ``FEED_SUBSCRIPTION``.
 """
 
+import asyncio
 import json
 import math
 import random
 import time
+from datetime import date
 
 import requests
 import websocket
@@ -26,9 +39,12 @@ from PySide6.QtCore import (
     QMutex, QMutexLocker, QRunnable, QSemaphore, QThread, QThreadPool,
     QTimer, Signal,
 )
+from tastytrade import Session as SdkSession
+from tastytrade.market_sessions import ExchangeType, get_market_holidays
+from tastytrade.metrics import get_market_metrics
 
 from applog import log
-from data_models import Quote
+from data_models import MarketCalendar, Quote, TickerInfo
 
 BASE = "https://api.tastyworks.com"
 
@@ -154,6 +170,176 @@ class TastytradeAPI:
         except Exception as exc:
             log.error(f"get_quote_token exception: {exc}")
         return None
+
+
+# ─── tastytrade SDK (reference data) ─────────────────────────────────────────
+
+# /market-metrics takes a comma-separated symbol list. 100 is the largest chunk
+# that stays comfortably inside the URL length limit and the endpoint's own cap;
+# a full 5,000-ticker watchlist is therefore ~50 requests rather than 5,000.
+METRICS_CHUNK = 100
+
+# Concurrent in-flight chunks. The endpoint is rate limited per session, and 8
+# has been the sweet spot: enough to saturate the link, few enough that a full
+# watchlist sweep doesn't start collecting 429s.
+METRICS_CONCURRENCY = 8
+
+# How long a blocking SDK call may take before the caller gives up. Generous,
+# because a cold 5,000-ticker sweep is 50 sequential-ish round trips.
+SDK_CALL_TIMEOUT = 300
+
+
+class MarketDataSession:
+    """Blocking façade over the async `tastytrade` SDK.
+
+    The SDK is httpx/asyncio all the way down, but every consumer in this app is
+    either a `QThread` or `parallel_map`. Rather than sprinkle `asyncio.run` at
+    the call sites — which would build (and re-authenticate) a fresh HTTP client
+    per call — this owns one long-lived event loop on a private thread, and one
+    `tastytrade.Session` living on it.
+
+    Thread affinity: the loop thread is the only thread that ever touches the
+    SDK session or its httpx client, which is what makes the whole thing safe to
+    share. `call()` hands a coroutine over and blocks, so — exactly like
+    `qtpool.parallel_map` — **it may only be called from a worker thread**.
+    """
+
+    def __init__(self, client_secret, refresh_token):
+        self._client_secret = client_secret
+        self._refresh_token = refresh_token
+        self._loop     = None
+        self._session  = None
+        self._ready    = QSemaphore(0)
+        self._thread   = QThread()
+        self._thread.run = self._run_loop        # no subclass needed for a body this small
+        self._thread.start()
+        # The loop must exist before anything can be submitted to it.
+        if not self._ready.tryAcquire(1, 10_000):
+            raise RuntimeError("tastytrade SDK event loop failed to start")
+
+    # ── loop lifecycle ──
+
+    def _run_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._ready.release()
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                loop.run_until_complete(self._aclose())
+            except Exception as exc:
+                log.debug(f"SDK session close failed: {exc}")
+            loop.close()
+            log.debug("tastytrade SDK event loop stopped")
+
+    async def _aclose(self):
+        if self._session is not None:
+            await self._session._client.aclose()
+            self._session = None
+
+    async def _ensure_session(self):
+        """Build the SDK session lazily, on the loop thread.
+
+        `Session.__init__` does no I/O but does construct an httpx `AsyncClient`,
+        which binds to whatever loop is running when it is first used — so it has
+        to be created here, not in `__init__`.
+        """
+        if self._session is None:
+            self._session = SdkSession(provider_secret=self._client_secret,
+                                       refresh_token=self._refresh_token)
+            log.info("tastytrade SDK session created (OAuth refresh grant)")
+        return self._session
+
+    def call(self, coro_factory, timeout=SDK_CALL_TIMEOUT):
+        """Run `coro_factory(session)` on the loop thread and return its result.
+
+        Blocks the calling thread — worker threads only, never the GUI thread.
+        """
+        async def _wrapped():
+            return await coro_factory(await self._ensure_session())
+
+        # run_coroutine_threadsafe hands back a concurrent.futures.Future. It is
+        # the sanctioned asyncio↔thread bridge and the only place in the app that
+        # sees one; it never leaves this method.
+        future = asyncio.run_coroutine_threadsafe(_wrapped(), self._loop)
+        return future.result(timeout)
+
+    def close(self):
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.quit()
+        self._thread.wait(5000)
+
+    # ── reference data ──
+
+    def fetch_ticker_info(self, symbols, progress_cb=None, should_cancel=None):
+        """Market cap / next earnings / next ex-dividend for many symbols.
+
+        Returns ``{symbol: TickerInfo}``, omitting symbols the endpoint doesn't
+        know (delisted tickers, non-equities). Chunks are issued concurrently
+        under a semaphore; one failing chunk is logged and skipped rather than
+        sinking the whole sweep, because a single bad symbol in a 5,000-line
+        watchlist should not abort a scan.
+
+        If *every* chunk fails this raises instead, since that means the session
+        is broken rather than the data being thin — and the caller caches what it
+        gets, so silently returning nothing would poison the ticker cache with
+        blanks for the whole TTL.
+        """
+        symbols = list(symbols)
+        if not symbols:
+            return {}
+        chunks = [symbols[i:i + METRICS_CHUNK]
+                  for i in range(0, len(symbols), METRICS_CHUNK)]
+        today  = date.today()
+
+        async def _run(session):
+            gate = asyncio.Semaphore(METRICS_CONCURRENCY)
+            out  = {}
+            done = failed = 0
+            last_error = None
+
+            async def _one(chunk):
+                nonlocal done, failed, last_error
+                if should_cancel and should_cancel():
+                    return
+                async with gate:
+                    try:
+                        metrics = await get_market_metrics(session, chunk)
+                    except Exception as exc:
+                        log.debug(f"market-metrics chunk of {len(chunk)} failed: {exc}")
+                        failed += 1
+                        last_error = exc
+                        metrics = []
+                for m in metrics:
+                    out[m.symbol] = TickerInfo.from_metric(m, today)
+                done += len(chunk)
+                if progress_cb:
+                    progress_cb(done, len(symbols))
+
+            await asyncio.gather(*(_one(c) for c in chunks))
+            if failed:
+                log.warning(f"market-metrics: {failed}/{len(chunks)} chunks failed")
+            if failed == len(chunks):
+                raise RuntimeError(
+                    f"Tastytrade market metrics unavailable: {last_error}")
+            return out
+
+        return self.call(_run)
+
+    def fetch_market_calendar(self):
+        """US equity holidays + half days. Returns None if the call fails."""
+        async def _run(session):
+            cal = await get_market_holidays(session)
+            return MarketCalendar(holidays=list(cal.holidays),
+                                  half_days=list(cal.half_days))
+        try:
+            return self.call(_run, timeout=30)
+        except Exception as exc:
+            log.warning(f"Market calendar fetch failed: {exc}")
+            return None
 
 
 # ─── DXLink shared helpers ───────────────────────────────────────────────────

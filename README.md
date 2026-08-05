@@ -4,7 +4,7 @@
 
 A PySide6 (Qt) desktop app that scans a watchlist for calendar spread setups, and ranks them by forward factor. Also allows you to analyse individual trades with a real-time P/L chart, and track open positions with live P/L.
 
-**Data sources:** Tastytrade API using DXLINK (option chains + quotes) and yfinance (earnings dates, market cap, dividend dates).
+**Data sources:** Tastytrade only — the REST API and DXLINK for option chains and quotes, and the official `tastytrade` SDK for reference data (earnings dates, market cap, dividend dates, market calendar).
 
 ---
 
@@ -97,6 +97,8 @@ python main.py
 2. On the **Scanner** view, click **Filters** to configure your watchlist path, target DTEs, IV method, and any filters you want.
 3. Click **Run Scan**. The button becomes **Cancel** while a scan is in flight.
 
+The top bar shows the current **New York time** and a **market status light** — green while the US equity market is in regular hours (Mon–Fri 09:30–16:00 ET, 13:00 on half days), red on weekends, holidays and outside those hours. Hover it for the reason. The holiday calendar comes from Tastytrade and is refreshed daily; if it can't be fetched the light falls back to weekends and regular hours only.
+
 The left rail switches between **Scanner**, **Positions**, **Settings** and **Logs**, and collapses to icons if you want more room for the table. **Settings** also holds *Sign out* and *Clear ticker cache*.
 
 Live quotes flash green or red on the cell that changed, and P/L and forward-factor columns are coloured by sign.
@@ -131,7 +133,7 @@ Open **Filters** from the Scanner view (or *Settings → Open filters & scan set
 
 ### Ticker info cache
 
-Earnings dates, market caps, and dividend dates are fetched from yfinance and cached in `~/.config/calendar-spread/ticker_info.json` to avoid re-fetching on every scan.
+Earnings dates, market caps, and dividend dates come from Tastytrade's `/market-metrics` endpoint (requested 100 symbols at a time, 8 chunks in flight) and are cached in `~/.config/calendar-spread/ticker_info.json` to avoid re-fetching on every scan.
 
 | Setting | Default | Description |
 |---|---|---|
@@ -170,7 +172,7 @@ Results are sorted by **Fwd Factor** (descending). Higher values indicate that t
 | **Fwd Factor** | `(Front IV − Fwd IV) / Fwd IV` — higher is more interesting |
 | Debit | Midpoint net debit to open: `(B-mid) − (F-mid)` |
 | F-Spread / B-Spread | Bid-ask spread width for each leg |
-| Earnings | Next earnings date (from yfinance) |
+| Earnings | Next earnings date (Tastytrade market metrics) |
 
 ### Fwd Factor formula
 
@@ -229,6 +231,11 @@ No compatible secret store was found (common on WSL2 or headless Linux). Credent
 
 **No quotes returned / DXLink timeout**
 DXLink quote tokens expire. The app fetches a fresh token before each scan. If the scan stalls at Phase 2, check the Logs view for `AUTH_STATE` errors and verify your refresh token is still valid.
+
+**Market status light looks wrong on a holiday**
+The holiday calendar is fetched from Tastytrade at startup. If that call failed the light only knows
+about weekends and regular hours — check the Logs view for `Market calendar`. On Windows, a missing
+`tzdata` package makes `zoneinfo` unable to resolve `America/New_York`; `pip install tzdata` fixes it.
 
 **Empty results after scanning**
 - Check that your watchlist CSV has a `TICKER` header and one symbol per line.

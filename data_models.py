@@ -37,6 +37,53 @@ class Quote:
         if other.last > 0: self.last = other.last
 
 
+# ─── Reference data (Tastytrade /market-metrics, /market-time) ───────────────
+
+@dataclass
+class TickerInfo:
+    """Per-symbol reference data used by the scan's pre/post filters.
+
+    Sourced from the Tastytrade SDK's `market-metrics` endpoint. The fields are
+    deliberately the three the filters actually consume — the endpoint returns
+    far more, but persisting only these keeps `ticker_info.json` compatible with
+    files written before the yfinance → Tastytrade migration.
+    """
+    earnings:   Optional[date]  = None
+    market_cap: Optional[float] = None
+    ex_div:     Optional[date]  = None
+
+    @classmethod
+    def from_metric(cls, metric, today: date) -> "TickerInfo":
+        """Map one `tastytrade.metrics.MarketMetricInfo` onto this carrier.
+
+        Everything is coerced out of `Decimal` and pydantic models here, at the
+        boundary, so nothing downstream — least of all `SORT_ROLE` — ever sees a
+        non-native numeric type.
+        """
+        def _future(value):
+            """Tastytrade reports the *last* ex-div as well as the next one; a
+            past date is not a filterable event, so drop it."""
+            return value if isinstance(value, date) and value >= today else None
+
+        earnings = getattr(metric, 'earnings', None)
+        cap      = getattr(metric, 'market_cap', None)
+        return cls(
+            earnings   = _future(getattr(earnings, 'expected_report_date', None)),
+            market_cap = float(cap) if cap is not None else None,
+            # dividend_next_date is the forward-looking field; dividend_ex_date
+            # is usually the most recent one, so it is only a fallback.
+            ex_div     = (_future(getattr(metric, 'dividend_next_date', None))
+                          or _future(getattr(metric, 'dividend_ex_date', None))),
+        )
+
+
+@dataclass
+class MarketCalendar:
+    """US equity market holidays and half days, as published by Tastytrade."""
+    holidays:  List[date] = field(default_factory=list)
+    half_days: List[date] = field(default_factory=list)
+
+
 # ─── Option chain ────────────────────────────────────────────────────────────
 
 @dataclass

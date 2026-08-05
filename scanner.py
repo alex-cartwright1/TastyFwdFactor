@@ -7,10 +7,10 @@ emissions.
 
 The phase ordering is a cost optimisation and must not be reordered:
 
-1. Ticker info (yfinance, concurrent, disk-cached with TTL) → pre-filter on
-   market cap / earnings / ex-div, so excluded tickers never trigger a chain
-   request. The pre-filter uses the *target* DTEs minus a 7-day safety buffer
-   because the actual expiry is not yet known.
+1. Ticker info (Tastytrade `/market-metrics`, chunked, disk-cached with TTL) →
+   pre-filter on market cap / earnings / ex-div, so excluded tickers never
+   trigger a chain request. The pre-filter uses the *target* DTEs minus a 7-day
+   safety buffer because the actual expiry is not yet known.
 2. Option chains for survivors only, then a post-filter that re-checks
    earnings/dividends against the *actual* front/back expiry dates.
 3. Equity quotes via DXLink → pick the ATM strike → option quotes via DXLink.
@@ -20,15 +20,12 @@ The phase ordering is a cost optimisation and must not be reordered:
 import os
 import random
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
-
-import yfinance as yf
 
 from api import describe_diags, fetch_quotes_with_retry
 from applog import log
 from config import load_ticker_cache, parse_iso_date, save_ticker_cache
-from data_models import ChainInfo, Quote, ScanResult
+from data_models import ChainInfo, Quote, ScanResult, TickerInfo
 from pricing import solve_calendar
 from qtpool import parallel_map
 
@@ -66,79 +63,20 @@ def load_watchlist(path):
     return tickers, True
 
 
-# ─── yfinance: earnings / market cap / ex-dividend ───────────────────────────
+# ─── Tastytrade market metrics: earnings / market cap / ex-dividend ──────────
 
-def _calendar_dates(cal, key):
-    """Pull a list of dates out of a yfinance calendar (handles dict / DataFrame)."""
-    if cal is None:
-        return []
-    try:
-        if hasattr(cal, 'loc') and hasattr(cal, 'index'):
-            return cal.loc[key].tolist() if key in cal.index else []
-        return cal.get(key, []) or []
-    except Exception:
-        return []
+def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
+                      force_refresh=False, should_cancel=None):
+    """Chunked Tastytrade `/market-metrics` fetch backed by an on-disk cache.
 
-
-def _next_future_date(candidates, today):
-    """First date in candidates that is >= today; returns date or None."""
-    if not isinstance(candidates, (list, tuple)):
-        candidates = [candidates]
-    for d in candidates:
-        if hasattr(d, 'date'):
-            d = d.date()
-        elif isinstance(d, (int, float)):
-            try:
-                d = datetime.fromtimestamp(d).date()
-            except (ValueError, OSError):
-                continue
-        if hasattr(d, 'year') and d >= today:
-            return d
-    return None
-
-
-@dataclass
-class TickerInfo:
-    earnings:   object = None      # datetime.date | None
-    market_cap: object = None      # float | None
-    ex_div:     object = None      # datetime.date | None
-
-
-def _fetch_single_ticker_info(symbol):
-    today = datetime.today().date()
-    info_out = TickerInfo()
-    try:
-        t    = yf.Ticker(symbol)
-        cal  = t.calendar
-        info = t.info
-        info_out.market_cap = info.get('marketCap')
-
-        # Earnings: prefer calendar, fall back to info
-        earnings = _next_future_date(_calendar_dates(cal, 'Earnings Date'), today)
-        if earnings is None:
-            ed = info.get('earningsDate') or info.get('earningsTimestamps')
-            earnings = _next_future_date(ed, today)
-        info_out.earnings = earnings
-
-        # Ex-dividend: same approach. info['exDividendDate'] is a unix timestamp
-        # of the *most recent* ex-div in many versions of yfinance, so filter by
-        # today before accepting it.
-        ex_div = _next_future_date(_calendar_dates(cal, 'Ex-Dividend Date'), today)
-        if ex_div is None:
-            ex_div = _next_future_date(info.get('exDividendDate'), today)
-        info_out.ex_div = ex_div
-    except Exception:
-        pass
-    return info_out
-
-
-def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
-                      ttl_days=7, force_refresh=False, should_cancel=None):
-    """Concurrent yfinance fetch backed by an on-disk cache.
-
-    Cached entries younger than `ttl_days` are reused without scraping. Entries
+    Cached entries younger than `ttl_days` are reused without a request. Entries
     whose cached earnings/ex-div date has already passed are re-fetched, since
-    yfinance may have rolled forward to the next event.
+    the endpoint will have rolled forward to the next event.
+
+    `sdk` is an `api.MarketDataSession`; the fetch blocks, so this must run on a
+    worker thread. Symbols the endpoint doesn't recognise come back absent and
+    are cached as an empty `TickerInfo`, so a delisted ticker is not re-requested
+    on every scan.
 
     Returns ``{symbol: TickerInfo}``.
     """
@@ -162,7 +100,7 @@ def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
 
     n_cached = len(symbols) - len(to_fetch)
     if to_fetch:
-        log.info(f"Ticker info: {n_cached} from cache, {len(to_fetch)} to scrape")
+        log.info(f"Ticker info: {n_cached} from cache, {len(to_fetch)} to fetch")
     else:
         log.info(f"Ticker info: all {n_cached} from cache")
         if progress_cb:
@@ -173,11 +111,21 @@ def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
         if progress_cb:
             progress_cb(n_cached + done, len(symbols))
 
-    for sym, info in parallel_map(_fetch_single_ticker_info, to_fetch,
-                                  max_workers=max_workers, progress_cb=_report,
-                                  should_cancel=should_cancel):
-        if isinstance(info, Exception):
-            log.debug(f"Ticker info {sym} failed: {info}")
+    fetched = sdk.fetch_ticker_info(to_fetch, progress_cb=_report,
+                                    should_cancel=should_cancel)
+    # A cancelled sweep leaves most symbols unrequested rather than unknown, so
+    # don't record blanks for them — that would suppress the real fetch for a
+    # full TTL the next time round.
+    cancelled = bool(should_cancel and should_cancel())
+    n_unknown = 0
+    for sym in to_fetch:
+        info = fetched.get(sym)
+        if info is None:
+            if cancelled:
+                continue
+            # Not an error: /market-metrics simply has no row for delisted or
+            # non-equity symbols. Cache the blank so the next scan skips it.
+            n_unknown += 1
             info = TickerInfo()
         out[sym] = info
         cache[sym] = {
@@ -187,6 +135,9 @@ def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
             'fetched_at': fetched_at,
         }
 
+    if n_unknown:
+        log.info(f"Ticker info: {n_unknown}/{len(to_fetch)} symbols unknown to "
+                 f"/market-metrics")
     save_ticker_cache(cache)
     return out
 
@@ -356,7 +307,7 @@ def calculate_calendar_metrics(chain: ChainInfo, option_quotes, iv_method):
 
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 
-def run_scan(api, settings, reporter=None):
+def run_scan(api, sdk, settings, reporter=None):
     """Execute the full scan. Returns a list of ScanResult sorted by fwd factor.
 
     Raises ScanAborted with a user-facing message when a phase leaves nothing to
@@ -403,8 +354,14 @@ def run_scan(api, settings, reporter=None):
         rep.progress(int(done / tot * 20))
         rep.status(f"Phase 1/4: Ticker info {done}/{tot}…")
 
-    info_map = fetch_ticker_info(tickers, progress_cb=_ep, ttl_days=ttl_days,
-                                 should_cancel=rep.cancelled)
+    try:
+        info_map = fetch_ticker_info(sdk, tickers, progress_cb=_ep,
+                                     ttl_days=ttl_days, should_cancel=rep.cancelled)
+    except Exception as exc:
+        # The filters key off this data, so continuing without it would silently
+        # scan tickers the user asked to exclude.
+        log.error(f"Ticker info fetch failed: {exc}")
+        raise ScanAborted(f"Could not fetch ticker info from Tastytrade: {exc}")
     check_cancel()
 
     # Conservative pre-filter cutoffs: the actual front/back expirations may

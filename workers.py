@@ -6,22 +6,28 @@ results reach the GUI is a signal. No widget is ever touched from these classes.
 
 from PySide6.QtCore import QMutex, QMutexLocker, QObject, QThread, Signal
 
-from api import TastytradeAPI
+from api import MarketDataSession, TastytradeAPI
 from applog import log
 from scanner import ScanAborted, resolve_position_legs, run_scan
 
 
 class ApiSession(QObject):
-    """Lazily-built, shared `TastytradeAPI`.
+    """Lazily-built, shared `TastytradeAPI` plus `MarketDataSession`.
 
     One instance is shared by the scan worker, the position resolver and both
     live clients, so construction is mutex-protected. `ensure()` performs an
-    OAuth round trip and must only be called from a worker thread.
+    OAuth round trip and must only be called from a worker thread; so must
+    `ensure_sdk()`, whose first call builds the SDK's event-loop thread.
+
+    Both clients are backed by the same OAuth grant — the hand-rolled
+    `TastytradeAPI` for chains and quote tokens, the SDK for reference data —
+    so a credential change has to invalidate both together.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._api    = None
+        self._sdk    = None
         self._mutex  = QMutex()
         self._secret = ''
         self._refresh = ''
@@ -31,6 +37,7 @@ class ApiSession(QObject):
             if (client_secret, refresh_token) != (self._secret, self._refresh):
                 self._secret, self._refresh = client_secret, refresh_token
                 self._api = None      # force re-auth with the new grant
+                self._close_sdk_locked()
         return self
 
     @property
@@ -52,9 +59,30 @@ class ApiSession(QObject):
             self._api = TastytradeAPI(self._secret, self._refresh)
             return self._api
 
+    def ensure_sdk(self) -> MarketDataSession:
+        """Shared `tastytrade` SDK session. Worker threads only — the first call
+        starts the SDK's private event-loop thread and later calls block on it."""
+        with QMutexLocker(self._mutex):
+            if self._sdk is not None:
+                return self._sdk
+            if not (self._secret and self._refresh):
+                raise RuntimeError("Tastytrade OAuth credentials are not set")
+            self._sdk = MarketDataSession(self._secret, self._refresh)
+            return self._sdk
+
+    def _close_sdk_locked(self):
+        """Tear the SDK loop down. Caller must hold the mutex."""
+        if self._sdk is not None:
+            try:
+                self._sdk.close()
+            except Exception as exc:
+                log.debug(f"SDK session shutdown: {exc}")
+            self._sdk = None
+
     def reset(self):
         with QMutexLocker(self._mutex):
             self._api = None
+            self._close_sdk_locked()
 
 
 class AuthWorker(QThread):
@@ -135,12 +163,13 @@ class ScanWorker(QThread):
         try:
             self.statusChanged.emit("Authenticating with Tastytrade (OAuth)…")
             api = self._session.ensure()
+            sdk = self._session.ensure_sdk()
         except Exception as exc:
             self.scanFailed.emit(f"Auth Error: {exc}")
             return
 
         try:
-            results = run_scan(api, self._settings, reporter=self)
+            results = run_scan(api, sdk, self._settings, reporter=self)
         except ScanAborted as exc:
             self.scanFailed.emit(str(exc))
             return
@@ -195,3 +224,32 @@ class PositionResolveWorker(QThread):
                 pid, res['front_streamer_symbol'], res['back_streamer_symbol'], '')
 
         self.resolveFinished.emit()
+
+
+class MarketCalendarWorker(QThread):
+    """Fetches the US equity holiday calendar for the header's status light.
+
+    The indicator is computed locally once a second, so the calendar only has to
+    be fetched occasionally — this runs once at startup and then daily. A failure
+    is not fatal: `market_clock.market_status` degrades to weekends + regular
+    hours when it has no calendar, so the light stays broadly correct offline.
+    """
+
+    calendarReady = Signal(object)      # data_models.MarketCalendar | None
+
+    def __init__(self, session: ApiSession, parent=None):
+        super().__init__(parent)
+        self._session = session
+
+    def run(self):
+        try:
+            sdk = self._session.ensure_sdk()
+        except Exception as exc:
+            log.warning(f"Market calendar: auth not ready ({exc})")
+            self.calendarReady.emit(None)
+            return
+        calendar = sdk.fetch_market_calendar()
+        if calendar:
+            log.info(f"Market calendar: {len(calendar.holidays)} holidays, "
+                     f"{len(calendar.half_days)} half days")
+        self.calendarReady.emit(calendar)

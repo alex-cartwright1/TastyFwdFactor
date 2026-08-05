@@ -5,8 +5,9 @@ the scan runs in a `ScanWorker`, quotes arrive through `LiveFeedController`, and
 every number is computed by `pricing` / `scanner` / `positions`. This class only
 wires those together and translates user actions into calls on them.
 
-Layout is a collapsible left rail (Scanner / Positions / Settings / Logs) driving
-a `QStackedWidget`. Each view carries its own action bar at the top, so the
+Layout is a top status bar (New York clock + market open/closed light) above a
+collapsible left rail (Scanner / Positions / Settings / Logs) driving a
+`QStackedWidget`. Each view carries its own action bar at the top, so the
 controls on screen are always the ones that apply to what's on screen.
 
 The window is constructed with an already-authenticated `ApiSession` handed over
@@ -36,11 +37,14 @@ from data_models import Position
 from delegates import SignedFlashDelegate, SortHeaderView
 from dialogs import FiltersDialog, PositionDialog
 from live import LiveFeedController
+from market_clock import OPEN, format_nyc, market_status
 from models import SORT_ROLE, PositionsModel, ScanResultsModel
 from positions import update_position_metrics
 from pricing import calc_implied_vol, forward_iv, solve_calendar
-from theme import T, Spinner, make_icon, separator, shadow
-from workers import ApiSession, PositionResolveWorker, ScanWorker
+from theme import T, Spinner, StatusDot, make_icon, separator, shadow
+from workers import (
+    ApiSession, MarketCalendarWorker, PositionResolveWorker, ScanWorker,
+)
 
 # Every result row streams. Anything less silently mixes live rows with rows
 # frozen at scan time, which makes sorting by a live column (Fwd Factor above
@@ -51,6 +55,11 @@ LIVE_MAX_ROWS  = 300
 MAX_LOG_LINES  = 5000    # debug pane ring buffer
 RAIL_EXPANDED  = 208
 RAIL_COLLAPSED = 56
+
+# The holiday calendar changes at most once a year, so re-fetching daily is
+# already generous; the open/closed decision itself is recomputed locally every
+# second and costs nothing.
+CALENDAR_REFRESH_MS = 24 * 60 * 60 * 1000
 
 
 class NavRail(QWidget):
@@ -185,6 +194,73 @@ def action_bar():
     return bar, layout
 
 
+class MarketStatusBar(QWidget):
+    """Top chrome: the New York wall clock and the market open/closed light.
+
+    Owns the one-second tick itself. The status decision is a pure function of
+    the clock plus a holiday calendar (`market_clock.market_status`), so this
+    never touches the network — the calendar is pushed in from a worker whenever
+    one lands, and until then the light already reads correctly for weekends and
+    regular trading hours.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TopBar")
+        self._calendar = None
+        self._state    = None      # last painted state; guards needless repaints
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 8, 16, 8)
+        row.setSpacing(10)
+
+        self.title = QLabel("TastyFwdFactor")
+        self.title.setObjectName("TopBarTitle")
+        row.addWidget(self.title)
+        row.addStretch(1)
+
+        self.clock = QLabel()
+        self.clock.setObjectName("TopBarClock")
+        row.addWidget(self.clock)
+
+        self.dot = StatusDot(12, T.MARKET_CLOSED, self)
+        row.addWidget(self.dot)
+
+        self.state_label = QLabel()
+        self.state_label.setObjectName("TopBarState")
+        row.addWidget(self.state_label)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+        self._tick()
+
+    def set_calendar(self, calendar):
+        self._calendar = calendar
+        self._state = None         # force a repaint: holidays may change the light
+        self._tick()
+
+    def _tick(self):
+        self.clock.setText(format_nyc())
+
+        state, tooltip = market_status(calendar=self._calendar)
+        if state == self._state:
+            return
+        self._state = state
+
+        is_open = state == OPEN
+        self.dot.set_colour(T.MARKET_OPEN if is_open else T.MARKET_CLOSED)
+        self.state_label.setText("OPEN" if is_open else "CLOSED")
+        self.state_label.setProperty("tone", "open" if is_open else "closed")
+        # A dynamic property only takes effect after a re-polish.
+        self.state_label.style().unpolish(self.state_label)
+        self.state_label.style().polish(self.state_label)
+
+        for widget in (self.dot, self.state_label, self.clock, self):
+            widget.setToolTip(tooltip)
+
+
 class MainWindow(QMainWindow):
 
     signOutRequested = Signal()
@@ -199,6 +275,7 @@ class MainWindow(QMainWindow):
         self.session  = session
         self._scan_worker    = None
         self._resolve_worker = None
+        self._calendar_worker = None
         self._chart_windows  = []      # keep references alive; Qt won't
         self._live_iv_method = self.settings.get('iv_method', 'Midpoint')
         self._signing_out    = False
@@ -226,11 +303,29 @@ class MainWindow(QMainWindow):
         if self.positions_model.rows:
             QTimer.singleShot(600, self._kick_positions_live)
 
+        # Same reasoning for the holiday calendar: the light is already painted
+        # from the local clock, so this only ever refines it.
+        self._calendar_timer = QTimer(self)
+        self._calendar_timer.setInterval(CALENDAR_REFRESH_MS)
+        self._calendar_timer.timeout.connect(self._fetch_market_calendar)
+        self._calendar_timer.start()
+        QTimer.singleShot(300, self._fetch_market_calendar)
+
     # ── UI construction ──────────────────────────────────────────────────────
 
     def _build_ui(self):
         central = QWidget()
-        layout = QHBoxLayout(central)
+        shell = QVBoxLayout(central)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        self.status_bar = MarketStatusBar()
+        shell.addWidget(self.status_bar)
+
+        body = QWidget()
+        # A bare QWidget container inherits the sheet's window background, which
+        # is what we want here — but say so rather than relying on it.
+        layout = QHBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -245,8 +340,31 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_logs_view())
         layout.addWidget(self.stack, 1)
 
+        shell.addWidget(body, 1)
+
         self.nav.set_current(0)
         self.setCentralWidget(central)
+
+    # ── Market status ────────────────────────────────────────────────────────
+
+    def _fetch_market_calendar(self):
+        """Refresh the holiday calendar behind the header light.
+
+        Skipped while one is already in flight — a stale calendar is harmless,
+        and the header never blocks on this.
+        """
+        if self._calendar_worker is not None and self._calendar_worker.isRunning():
+            return
+        self._calendar_worker = MarketCalendarWorker(self.session, self)
+        self._calendar_worker.calendarReady.connect(self._on_calendar_ready)
+        self._calendar_worker.start()
+
+    def _on_calendar_ready(self, calendar):
+        if calendar is None:
+            log.debug("Market calendar unavailable — status light using local "
+                      "hours and weekends only")
+            return
+        self.status_bar.set_calendar(calendar)
 
     def _switch_view(self, index):
         self.stack.setCurrentIndex(index)
@@ -493,8 +611,9 @@ class MainWindow(QMainWindow):
 
         card, layout = self._settings_card(
             "TICKER DATA CACHE",
-            "Earnings, market cap and ex-dividend dates scraped from yfinance "
-            "are cached on disk. Clearing forces a full re-scrape on the next scan.")
+            "Earnings, market cap and ex-dividend dates from Tastytrade market "
+            "metrics are cached on disk. Clearing forces a full refetch on the "
+            "next scan.")
         clear_btn = QPushButton("Clear ticker cache")
         clear_btn.clicked.connect(self._clear_cache)
         layout.addWidget(clear_btn, 0, Qt.AlignmentFlag.AlignLeft)
@@ -641,7 +760,7 @@ class MainWindow(QMainWindow):
         clear_ticker_cache()
         QMessageBox.information(
             self, "Cache cleared",
-            "Ticker info cache cleared. The next scan will re-scrape earnings, "
+            "Ticker info cache cleared. The next scan will refetch earnings, "
             "dividends and market caps for all tickers.")
 
     def _sign_out(self):
@@ -1102,8 +1221,13 @@ class MainWindow(QMainWindow):
             self._scan_worker.wait(3000)
         if self._resolve_worker is not None and self._resolve_worker.isRunning():
             self._resolve_worker.wait(3000)
+        if self._calendar_worker is not None and self._calendar_worker.isRunning():
+            self._calendar_worker.wait(3000)
         self.results_feed.stop()
         self.positions_feed.stop()
+        # Stops the SDK's event-loop thread, which would otherwise sit in
+        # run_forever() and keep the process alive.
+        self.session.reset()
 
     def closeEvent(self, event):
         self.shutdown()
