@@ -22,7 +22,11 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from applog import log
 from data_models import Quote
 
-FLUSH_MS = 750
+# Coalescing window for quote-driven repaints. 750 ms made a moving market look
+# a step behind on the tape; 250 ms still folds a burst of ticks into one
+# repaint, and the flash fade (models.FLASH_TICK_MS, 100 ms) is the finer timer
+# on the GUI thread either way.
+FLUSH_MS = 250
 
 
 class LiveFeedController(QObject):
@@ -62,6 +66,13 @@ class LiveFeedController(QObject):
         """Latest merged quote. Served from the stream's store, which is the one
         cache in the app — the scan reads the same object."""
         return self._stream.quote(symbol)
+
+    def has_quote(self, symbol, field=None) -> bool:
+        """Whether a live value has been seen for `symbol` (optionally for one
+        field). A row uses this to decide that a 0.0 bid is the market speaking
+        rather than "nothing has arrived yet"."""
+        q = self._stream.quote(symbol)
+        return q.has(field) if field else bool(q.provided)
 
     # ── lifecycle ──
 

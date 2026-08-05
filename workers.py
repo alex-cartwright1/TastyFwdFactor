@@ -8,7 +8,19 @@ from PySide6.QtCore import QMutex, QMutexLocker, QObject, QThread, Signal
 
 from api import MarketDataSession, TastytradeAPI
 from applog import log
+from config import load_settings
 from scanner import ScanAborted, resolve_position_legs, run_scan
+
+
+def _settings_chain_ttl():
+    """Chain-cache TTL in seconds from the saved settings, for the API instance
+    built before any view has passed its own value down."""
+    try:
+        days = int(load_settings().get('chain_cache_ttl_days', 7))
+    except Exception as exc:
+        log.debug(f"Chain TTL from settings failed ({exc}); using the default")
+        days = 7
+    return max(days, 0) * 86400
 
 
 class ApiSession(QObject):
@@ -33,11 +45,25 @@ class ApiSession(QObject):
         self._refresh = ''
         # Chain-cache TTL in seconds, needed at TastytradeAPI construction so the
         # on-disk cache can be seeded (and expired entries dropped) up front.
-        self._chain_ttl = 0
+        # Seeded from the saved settings rather than 0: the login screen builds
+        # the API before any window has had a chance to call `set_chain_ttl`, so
+        # defaulting to 0 meant that instance loaded nothing from disk and the
+        # first scan of every launch refetched the whole watchlist.
+        self._chain_ttl = _settings_chain_ttl()
 
     def set_chain_ttl(self, seconds):
+        ttl = max(int(seconds), 0)
         with QMutexLocker(self._mutex):
-            self._chain_ttl = max(int(seconds), 0)
+            self._chain_ttl = ttl
+            api = self._api
+        # If the API already exists it was built with the old TTL, so its cache
+        # may never have been seeded. Load it now — `import_entries` tops the
+        # cache up rather than replacing this session's fetches.
+        if api is not None and ttl > 0 and not api.chains.loaded_from_disk:
+            try:
+                api._load_chains(ttl)
+            except Exception as exc:
+                log.warning(f"Could not seed chain cache from disk: {exc}")
         return self
 
     def set_credentials(self, client_secret, refresh_token):
@@ -236,10 +262,13 @@ class PositionResolveWorker(QThread):
     resolveFinished = Signal()
     resolveFailed = Signal(str)
 
-    def __init__(self, session: ApiSession, positions, chain_ttl=0, parent=None):
+    def __init__(self, session: ApiSession, positions, chain_ttl=None, parent=None):
         super().__init__(parent)
-        self._session   = session
-        self._chain_ttl = chain_ttl
+        self._session = session
+        # Opening or editing a position used to bypass the cache entirely and
+        # refetch the ticker's whole chain; the configured TTL applies here too.
+        self._chain_ttl = (_settings_chain_ttl() if chain_ttl is None
+                           else max(int(chain_ttl), 0))
         # Copy only what the worker needs — the Position objects themselves stay
         # owned by the GUI thread.
         self._specs = [

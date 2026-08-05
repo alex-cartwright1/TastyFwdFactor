@@ -35,7 +35,9 @@ from api import (
     QUOTE_COVERAGE, QUOTE_QUIET_SECS, describe_diags, fetch_quotes_with_retry,
 )
 from applog import log
-from config import load_ticker_cache, parse_iso_date, save_ticker_cache
+from config import (
+    DEFAULT_SETTINGS, load_ticker_cache, parse_iso_date, save_ticker_cache,
+)
 from data_models import ChainInfo, Quote, ScanResult, TickerInfo
 from pricing import solve_calendar
 from qtpool import parallel_map
@@ -53,6 +55,11 @@ CHAIN_WORKERS_MAX     = 50
 # it once the results table has declared its own set, so nothing the scan
 # subscribed outlives the scan.
 SCAN_CONSUMER = "scan"
+
+# Chain-cache TTL for call sites that aren't handed the user's settings — the
+# position leg resolver. `run_scan` reads `chain_cache_ttl_days` itself.
+DEFAULT_CHAIN_TTL_SECS = max(
+    int(DEFAULT_SETTINGS.get('chain_cache_ttl_days', 7)), 0) * 86400
 
 
 class ScanAborted(Exception):
@@ -266,12 +273,19 @@ def _streamer_symbol(strike_entry):
 
 
 def resolve_position_legs(api, ticker, strike, front_expiry, back_expiry,
-                          cache_ttl=0):
+                          cache_ttl=None):
     """Look up call-streamer-symbols + DTEs for a manually entered position.
+
+    `cache_ttl` defaults to the configured chain-cache TTL rather than 0: a
+    position's chain is almost always one a recent scan already fetched, and
+    forcing a refetch put a multi-second network round trip in front of every
+    add/edit and every launch that restores positions.
 
     Raises ValueError with a human-readable message if the chain doesn't contain
     a matching expiration or strike.
     """
+    if cache_ttl is None:
+        cache_ttl = DEFAULT_CHAIN_TTL_SECS
     chain_data = api.get_option_chain(ticker, cache_ttl=cache_ttl)
     if not chain_data:
         raise ValueError(f"No option chain returned for {ticker}")

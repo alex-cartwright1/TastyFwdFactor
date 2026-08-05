@@ -240,6 +240,10 @@ class ChainCache:
         # Set by anything that changes the contents, cleared by export_entries,
         # so shutdown after a fully-cached scan writes nothing.
         self._dirty    = False
+        # True once the on-disk cache has been folded in. Until then this
+        # instance holds only what *this* session fetched, so writing it out
+        # verbatim would delete every other chain the file already has.
+        self._loaded   = False
 
     # Compression level 1: the payload is highly repetitive JSON, so level 1
     # already gets ~87x and costs a fraction of what level 6 does — this runs
@@ -334,6 +338,9 @@ class ChainCache:
             self._order.clear()
             self.hits = self.misses = self.evictions = self.bytes = 0
             self._dirty = True
+            # A wipe is deliberate, so the next save must not merge the file's
+            # entries back in — this instance is now the whole truth.
+            self._loaded = True
         return n
 
     def stats(self):
@@ -358,16 +365,45 @@ class ChainCache:
                  if ttl_secs > 0 and (now - e.get('fetched_at', 0)) < ttl_secs]
         fresh.sort(key=lambda kv: kv[1].get('fetched_at', 0))
         with QMutexLocker(self._mutex):
+            # Anything already here was fetched this session and is therefore at
+            # least as fresh as the file — so a reload (the TTL setting arriving
+            # after construction) tops the cache up rather than overwriting it.
+            had_unsaved = self._dirty
             for sym, e in fresh[-self._max:]:
+                old = self._entries.get(sym)
+                if old is not None:
+                    if old['fetched_at'] >= e['fetched_at']:
+                        continue
+                    self.bytes -= len(old['blob'])
                 self._entries[sym] = {'blob':        e['blob'],
                                       'fetched_at':  e['fetched_at'],
                                       'expirations': []}
-                self._order.append(sym)
+                self._touch(sym)
                 self.bytes += len(e['blob'])
-            # Loading is not a change worth writing back.
-            self._dirty = False
+            while len(self._order) > self._max:
+                evicted = self._order.pop(0)
+                dropped = self._entries.pop(evicted, None)
+                if dropped is not None:
+                    self.bytes -= len(dropped['blob'])
+                self.evictions += 1
+            # Loading is not itself a change worth writing back, but it must not
+            # discard fetches that haven't been saved yet.
+            self._dirty  = had_unsaved
+            self._loaded = True
             loaded, skipped = len(self._entries), len(entries) - len(fresh)
         return loaded, skipped
+
+    @property
+    def loaded_from_disk(self):
+        """Whether this instance was seeded from `chain_cache.bin`.
+
+        False means a save must *merge* rather than replace: the in-memory set is
+        only this session's fetches, and clobbering the file with it would throw
+        away every chain a previous session cached. Also set by `clear()`, which
+        is a deliberate wipe of both.
+        """
+        with QMutexLocker(self._mutex):
+            return self._loaded
 
     def export_entries(self):
         """Snapshot for `config.save_chain_cache`, or None if nothing changed
@@ -399,6 +435,12 @@ class ChainCache:
 # concurrent fan-out over it, which is Phase 2's chain fetch.
 HTTP_POOL_SIZE = 50
 
+# Chain-cache TTL assumed when the caller doesn't supply one. Mirrors config's
+# `chain_cache_ttl_days` default: defaulting to 0 meant an API built before the
+# setting was read cached nothing *and* seeded nothing from disk, so the first
+# scan of every launch refetched the whole watchlist.
+CHAIN_TTL_DEFAULT_SECS = 7 * 86400
+
 # DXLink quote tokens are reusable until they expire. The response carries an
 # `expires-at`; when it doesn't, assume this and refresh well inside it.
 QUOTE_TOKEN_TTL_FALLBACK = 15 * 60
@@ -413,7 +455,8 @@ class TastytradeAPI:
     every REST method.
     """
 
-    def __init__(self, client_secret, refresh_token, chain_ttl_secs=0):
+    def __init__(self, client_secret, refresh_token,
+                 chain_ttl_secs=CHAIN_TTL_DEFAULT_SECS):
         self.session = requests.Session()
         # urllib3's default pool is 10 connections. Phase 2 fans chain requests
         # out over CHAIN_WORKERS threads on this one Session, and every worker
@@ -460,10 +503,25 @@ class TastytradeAPI:
 
     def save_chains(self):
         """Persist the chain cache if it changed. Safe to call from any thread —
-        it snapshots under the cache mutex and writes outside it."""
+        it snapshots under the cache mutex and writes outside it.
+
+        When the cache was never seeded from disk, the snapshot is only this
+        session's fetches; the file is merged under it instead of being replaced,
+        because writing a partial snapshot verbatim would delete every chain a
+        previous session had cached.
+        """
         entries = self.chains.export_entries()
-        if entries is not None:
-            save_chain_cache(entries)
+        if entries is None:
+            return
+        if not self.chains.loaded_from_disk:
+            on_disk = load_chain_cache()
+            if on_disk:
+                log.debug(f"Chain cache: merging {len(entries)} in-memory chain(s) "
+                          f"over {len(on_disk)} on disk (cache was never seeded)")
+                merged = dict(on_disk)
+                merged.update(entries)      # this session's fetches are newer
+                entries = merged
+        save_chain_cache(entries)
 
     def _refresh_access_token(self):
         """Body matches both official SDKs: client_id and redirect_uri are not
@@ -820,20 +878,50 @@ def _safe_float(val):
         return 0.0
 
 
+def _quote_float(val):
+    """Feed value -> float, or None when the field is absent or not a real price.
+
+    Distinct from `_safe_float`, which folds both "no value" and a genuine zero
+    into 0.0. That is exactly the distinction a merge needs: DXLink sends NaN for
+    a field it has nothing for (an illiquid contract with no bid at all), and
+    overwriting a good price with 0.0 on every such tick would blank the row —
+    but a bid that really goes to 0.0 must replace the previous number.
+    """
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f) or f < 0:
+        return None
+    return f
+
+
 def _apply_event(event_type, ev, quotes, touched):
     """Merge one decoded event into `quotes` (symbol -> Quote); record the
-    symbol in `touched`."""
+    symbol in `touched`.
+
+    Only the fields the event actually carried a value for are marked provided,
+    so `Quote.merge` overwrites those and leaves the rest alone.
+    """
     sym = ev.get('eventSymbol')
     if not sym:
         return
-    q = quotes.setdefault(sym, Quote())
+    update, provided = Quote(), set()
     if event_type == 'Quote':
-        q.merge(Quote(bid=_safe_float(ev.get('bidPrice')),
-                      ask=_safe_float(ev.get('askPrice'))))
+        fields = (('bid', 'bidPrice'), ('ask', 'askPrice'))
     elif event_type == 'Trade':
-        q.merge(Quote(last=_safe_float(ev.get('price'))))
+        fields = (('last', 'price'),)
     else:
         return
+    for name, key in fields:
+        value = _quote_float(ev.get(key))
+        if value is not None:
+            setattr(update, name, value)
+            provided.add(name)
+    if not provided:
+        return
+    update.provided = frozenset(provided)
+    quotes.setdefault(sym, Quote()).merge(update)
     touched.add(sym)
 
 
@@ -914,12 +1002,14 @@ class QuoteStore:
             q = self._quotes.get(symbol)
             # A copy: the caller reads it off-mutex, and the socket thread would
             # otherwise mutate it underneath them mid-calculation.
-            return Quote(q.bid, q.ask, q.last) if q else Quote()
+            # `provided` rides along: the caller needs it to tell a live 0.0 from
+            # a field this symbol has never quoted.
+            return Quote(q.bid, q.ask, q.last, q.provided) if q else Quote()
 
     def snapshot(self, symbols=None):
         with QMutexLocker(self._mutex):
             keys = list(self._quotes) if symbols is None else symbols
-            return {s: Quote(q.bid, q.ask, q.last)
+            return {s: Quote(q.bid, q.ask, q.last, q.provided)
                     for s in keys
                     for q in (self._quotes.get(s),) if q is not None}
 

@@ -419,6 +419,18 @@ class MainWindow(QMainWindow):
         self.search_edit.setCompleter(completer)
         header.actions.addWidget(self.search_edit)
 
+        # The line edit's own clear button only appears once there is text, and
+        # it is easy to miss that a stale filter is why the table looks empty
+        # after a scan — so the filter also has an explicit control of its own,
+        # paired with the state badge in the action bar below.
+        self.search_clear_btn = QPushButton("Clear")
+        self.search_clear_btn.setProperty("variant", "ghost")
+        self.search_clear_btn.setToolTip(
+            "Clear the ticker filter and show every scanned row")
+        self.search_clear_btn.setEnabled(False)
+        self.search_clear_btn.clicked.connect(self._clear_search_filter)
+        header.actions.addWidget(self.search_clear_btn)
+
         self.search_btn = QPushButton("Search")
         self.search_btn.setToolTip("Scan just this ticker, ignoring the filters")
         self.search_btn.clicked.connect(self._search_ticker)
@@ -451,6 +463,14 @@ class MainWindow(QMainWindow):
         self.progress.setFixedWidth(220)
         self.progress.setTextVisible(False)
         bar_layout.addWidget(self.progress)
+
+        bar_layout.addWidget(separator(vertical=True))
+        # Says whether the table is showing everything or a filtered subset —
+        # the row count alone can't distinguish "the scan found 3" from "the
+        # filter is hiding 300".
+        self.filter_badge = QLabel("No rows")
+        self.filter_badge.setStyleSheet(self._badge_style(T.TEXT_MUTED))
+        bar_layout.addWidget(self.filter_badge)
 
         bar_layout.addWidget(separator(vertical=True))
         self.live_badge = QLabel("Idle")
@@ -836,14 +856,18 @@ class MainWindow(QMainWindow):
             log.info(f"Filters updated: {self.settings}")
 
     def _clear_cache(self):
+        # The in-memory cache goes first: clearing only the files would leave the
+        # live instance holding the same chains, and its next save would write
+        # them straight back over the files we just deleted.
+        api = self.session.peek()
+        n_chains = api.chains.clear() if api is not None else 0
         clear_ticker_cache()
-        clear_chain_cache()
         # The chain cache goes with it: the fundamentals refresh is exactly the
         # event that can invalidate a cached expiration list, and leaving stale
         # chains behind would undo the point of clearing.
-        api = self.session.peek()
-        n_chains = api.chains.clear() if api is not None else 0
-        log.info(f"Caches cleared: ticker info + {n_chains} option chain(s)")
+        clear_chain_cache()
+        log.info(f"Caches cleared: ticker info + {n_chains} option chain(s) "
+                 f"(memory and disk)")
         QMessageBox.information(
             self, "Cache cleared",
             f"Ticker info cache cleared, along with {n_chains} cached option "
@@ -881,6 +905,16 @@ class MainWindow(QMainWindow):
         self.results_feed.stop()
         if not only_tickers:
             self.results_model.set_rows([])
+            # A full scan shows everything it finds. A filter left over from an
+            # earlier search would hide most of the new results and read as a
+            # scan that found nothing, so it is dropped here rather than left for
+            # the user to notice. `blockSignals` avoids a filter round trip
+            # against the table we are about to clear anyway.
+            if self.search_edit.text():
+                self.search_edit.blockSignals(True)
+                self.search_edit.clear()
+                self.search_edit.blockSignals(False)
+            self.results_proxy.setFilterFixedString('')
         self._set_live_badge("Idle", state=None)
         self._update_results_empty_state()
 
@@ -980,9 +1014,15 @@ class MainWindow(QMainWindow):
 
         if targets:
             rows = self._merge_results(results, targets)
+            # The search leaves the ticker filter on, so say so — otherwise the
+            # merged row count and the visible row count disagree with no
+            # explanation on screen.
+            filtered = self.search_edit.text().strip()
+            suffix = (f" Filter “{filtered}” is on — press Clear to see all "
+                      f"{len(rows)}." if filtered else "")
             self.status_label.setText(
                 f"{len(results)} setup(s) for {', '.join(targets)} — "
-                f"{len(rows)} row(s) in the table.")
+                f"{len(rows)} row(s) in the table.{suffix}")
         else:
             rows = list(results)
             self.results_model.set_rows(rows)
@@ -1052,10 +1092,14 @@ class MainWindow(QMainWindow):
             eq = feed.quote(r.ticker)
             price = eq.price if eq.price > 0 else r.price
             fq, bq = feed.quote(r.front_sym), feed.quote(r.back_sym)
-            f_bid = fq.bid or r.f_bid
-            f_ask = fq.ask or r.f_ask
-            b_bid = bq.bid or r.b_bid
-            b_ask = bq.ask or r.b_ask
+            # `has(field)` rather than a truthiness test: a leg whose bid is
+            # pulled quotes a real 0.0, and `or r.f_bid` pinned that cell to the
+            # scan-time number for the rest of the session. Fall back only while
+            # the field has genuinely never been quoted.
+            f_bid = fq.bid if fq.has('bid') else r.f_bid
+            f_ask = fq.ask if fq.has('ask') else r.f_ask
+            b_bid = bq.bid if bq.has('bid') else r.b_bid
+            b_ask = bq.ask if bq.has('ask') else r.b_ask
 
             # A None solve still updates the quote columns; the metrics simply
             # hold their previous values.
@@ -1086,9 +1130,35 @@ class MainWindow(QMainWindow):
         self.results_proxy.setFilterFixedString(symbol)
         self._update_results_empty_state(symbol)
 
+    def _clear_search_filter(self):
+        """Clear button: drop the filter and show the whole table again."""
+        if self.search_edit.text():
+            self.search_edit.clear()        # textChanged re-applies an empty filter
+        else:
+            self._apply_ticker_filter('')
+
+    def _update_filter_badge(self, symbol=None):
+        """Report whether the proxy filter is hiding anything."""
+        symbol = (self.search_edit.text() if symbol is None else symbol).strip().upper()
+        total  = self.results_model.rowCount()
+        shown  = self.results_proxy.rowCount()
+        self.search_clear_btn.setEnabled(bool(symbol))
+        if symbol:
+            self.filter_badge.setText(f"Filtered: {symbol} — {shown} of {total}")
+            self.filter_badge.setStyleSheet(
+                self._badge_style(T.ACCENT, "rgba(76,141,255,0.12)"))
+            self.filter_badge.setToolTip(
+                f"Showing only rows for {symbol}. Press Clear to show all "
+                f"{total} row(s).")
+        else:
+            self.filter_badge.setText(f"All rows ({total})" if total else "No rows")
+            self.filter_badge.setStyleSheet(self._badge_style(T.TEXT_MUTED))
+            self.filter_badge.setToolTip("No ticker filter — every scanned row is shown.")
+
     def _update_results_empty_state(self, symbol=None):
         """Swap between the table and the empty-state message."""
         symbol = self.search_edit.text().strip() if symbol is None else symbol
+        self._update_filter_badge(symbol)
         if self.results_proxy.rowCount() > 0:
             self.results_stack.setCurrentWidget(self.results_view)
             return
