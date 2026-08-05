@@ -83,6 +83,12 @@ class CalendarIVs:
     fwd_factor: float
     debit:      float
 
+    @property
+    def max_risk(self) -> float:
+        """Worst case per contract. A long calendar can only lose the debit —
+        both legs share a strike, so the spread can never invert."""
+        return max(self.debit, 0.0) * PER_CONTRACT
+
 
 def forward_iv(front_iv, back_iv, t1, t2) -> Optional[float]:
     """Forward vol between t1 and t2, or None if the variance term is negative
@@ -134,6 +140,45 @@ def solve_calendar(price, strike, front_dte, back_dte,
         fwd_iv     = fwd,
         fwd_factor = (f_iv - fwd) / fwd,
         debit      = (b_bid + b_ask) / 2 - (f_bid + f_ask) / 2,
+    )
+
+
+def solve_fills(price, strike, front_dte, back_dte,
+                front_credit, back_paid) -> Optional[CalendarIVs]:
+    """The 'real' forward factor implied by prices actually paid/received.
+
+    `solve_calendar` works from a market snapshot (bid/ask); this works from two
+    fill prices, so it answers 'what am I really getting at this fill?'. Same
+    model, different inputs — and it lives here, next to `solve_calendar`, so the
+    trade panel and the setup detail window can't drift apart the way the legacy
+    code did.
+
+    Returns None when the fills can't support the model (non-positive prices, a
+    degenerate IV solve, or negative forward variance).
+    """
+    if price <= 0 or strike <= 0 or front_credit <= 0 or back_paid <= 0:
+        return None
+
+    t1 = front_dte / DAYS_PER_YEAR
+    t2 = back_dte  / DAYS_PER_YEAR
+    if t1 <= 0 or t2 <= t1:
+        return None
+
+    f_iv = calc_implied_vol(front_credit, price, strike, t1)
+    b_iv = calc_implied_vol(back_paid,    price, strike, t2)
+    if f_iv <= 0.01 or b_iv <= 0.01:
+        return None
+
+    fwd = forward_iv(f_iv, b_iv, t1, t2)
+    if fwd is None:
+        return None
+
+    return CalendarIVs(
+        front_iv   = f_iv,
+        back_iv    = b_iv,
+        fwd_iv     = fwd,
+        fwd_factor = (f_iv - fwd) / fwd,
+        debit      = back_paid - front_credit,
     )
 
 

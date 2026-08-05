@@ -45,6 +45,7 @@ from tastytrade.metrics import get_market_metrics
 
 from applog import log
 from data_models import MarketCalendar, Quote, TickerInfo
+from qtpool import parallel_map
 
 BASE = "https://api.tastyworks.com"
 
@@ -74,6 +75,114 @@ _FEED_SETUP = {
 }
 
 
+# ─── Option chain cache ──────────────────────────────────────────────────────
+
+# In-memory only, and capped. A nested chain is a large JSON blob (hundreds of
+# strikes across dozens of expirations), so caching a full 5,000-ticker sweep
+# would cost more memory than the scan saves in time. The cap keeps the entries
+# that actually get reused — the survivors of the pre-filter, and whatever the
+# user is searching — and evicts least-recently-used beyond that.
+CHAIN_CACHE_MAX = 500
+
+
+class ChainCache:
+    """Thread-safe TTL + LRU cache of nested option chains, keyed by ticker.
+
+    Every scan worker and the single-ticker search share one instance through
+    `TastytradeAPI`, and `parallel_map` hits it from ten threads at once, so all
+    access is under one mutex. Entries carry the fetch timestamp and the
+    expiration dates present in the payload, which is what makes a stale entry
+    identifiable in the log rather than just silently replaced.
+    """
+
+    def __init__(self, max_entries=CHAIN_CACHE_MAX):
+        self._mutex   = QMutex()
+        self._entries = {}          # symbol -> {'chain', 'fetched_at', 'expirations'}
+        self._order   = []          # symbols, least-recently-used first
+        self._max     = max_entries
+        self.hits     = 0
+        self.misses   = 0
+
+    @staticmethod
+    def _expirations(chain):
+        try:
+            return [e.get('expiration-date') for e in chain[0].get('expirations', [])]
+        except (IndexError, AttributeError, TypeError):
+            return []
+
+    def get(self, symbol, ttl_secs):
+        """Cached chain for `symbol`, or None on miss/expiry. `ttl_secs <= 0`
+        disables the cache entirely."""
+        if ttl_secs <= 0:
+            return None
+        with QMutexLocker(self._mutex):
+            entry = self._entries.get(symbol)
+            if entry is None:
+                self.misses += 1
+                return None
+            if time.time() - entry['fetched_at'] >= ttl_secs:
+                # Expired: drop it now so a failed refetch doesn't keep serving
+                # a chain whose front expiration may already have passed.
+                self._entries.pop(symbol, None)
+                self._discard_order(symbol)
+                self.misses += 1
+                return None
+            self._touch(symbol)
+            self.hits += 1
+            return entry['chain']
+
+    def put(self, symbol, chain):
+        if not chain:
+            return
+        with QMutexLocker(self._mutex):
+            self._entries[symbol] = {
+                'chain':       chain,
+                'fetched_at':  time.time(),
+                'expirations': self._expirations(chain),
+            }
+            self._touch(symbol)
+            while len(self._order) > self._max:
+                evicted = self._order.pop(0)
+                self._entries.pop(evicted, None)
+
+    def invalidate(self, symbols):
+        """Drop specific tickers — used when their fundamentals are refreshed,
+        since a corporate action that moves an earnings date can also add or
+        remove expirations."""
+        with QMutexLocker(self._mutex):
+            dropped = 0
+            for sym in symbols:
+                if self._entries.pop(sym, None) is not None:
+                    self._discard_order(sym)
+                    dropped += 1
+        return dropped
+
+    def clear(self):
+        with QMutexLocker(self._mutex):
+            n = len(self._entries)
+            self._entries.clear()
+            self._order.clear()
+            self.hits = self.misses = 0
+        return n
+
+    def stats(self):
+        with QMutexLocker(self._mutex):
+            return {'entries': len(self._entries),
+                    'hits': self.hits, 'misses': self.misses}
+
+    # Both helpers assume the caller holds the mutex.
+
+    def _touch(self, symbol):
+        self._discard_order(symbol)
+        self._order.append(symbol)
+
+    def _discard_order(self, symbol):
+        try:
+            self._order.remove(symbol)
+        except ValueError:
+            pass
+
+
 # ─── REST ────────────────────────────────────────────────────────────────────
 
 class TastytradeAPI:
@@ -91,6 +200,9 @@ class TastytradeAPI:
         self._access_token  = None
         self._access_token_expiry = 0.0
         self._token_mutex = QMutex()
+        # Shared by the scan pool and the single-ticker search — one instance per
+        # API session, so a search warms the cache the next scan reads.
+        self.chains = ChainCache()
         self._refresh_access_token()
 
     def _refresh_access_token(self):
@@ -125,14 +237,26 @@ class TastytradeAPI:
                 log.info("Access token near/past expiry — refreshing")
                 self._refresh_access_token()
 
-    def get_option_chain(self, symbol, retries=5, timeout=30):
+    def get_option_chain(self, symbol, retries=5, timeout=30, cache_ttl=0):
+        """Nested option chain for `symbol`, served from `self.chains` when a
+        live entry exists. `cache_ttl` is in seconds; 0 bypasses the cache."""
+        cached = self.chains.get(symbol, cache_ttl)
+        if cached is not None:
+            return cached
+
+        # Jitter before the request, not before the cache lookup: it exists to
+        # desync the ten pool workers so they don't all hit the rate limit on the
+        # same instant, and a cache hit does no I/O to stagger.
+        time.sleep(random.uniform(0.05, 0.15))
         self._ensure_access_token()
         url = f"{BASE}/option-chains/{symbol}/nested"
         for attempt in range(retries):
             try:
                 r = self.session.get(url, timeout=timeout)
                 if r.status_code == 200:
-                    return r.json()['data']['items']
+                    chain = r.json()['data']['items']
+                    self.chains.put(symbol, chain)
+                    return chain
                 log.debug(f"Chain {symbol}: HTTP {r.status_code} (attempt {attempt+1}) — {r.text[:120]}")
                 # Retry on rate limiting (429) and transient server errors;
                 # give up on other client errors (404, 401, etc).
@@ -441,6 +565,12 @@ def _parse_feed_data(raw_data, field_map, quotes):
 # 3 symbols each, so one frame carrying the lot would be needlessly large.
 SUBSCRIBE_CHUNK = 200
 
+# Concurrent one-shot DXLink connections. Each quote token supports a limited
+# number of streamer sessions, and every socket costs a thread parked on a
+# semaphore, so this is deliberately well under the batch count — the win is
+# hiding one batch's timeout behind another's, not opening 25 sockets.
+QUOTE_SOCKETS = 4
+
 
 def _subscription_frames(quote_syms, trade_syms, chunk=SUBSCRIBE_CHUNK):
     """FEED_SUBSCRIPTION frames covering these symbols, chunked."""
@@ -604,18 +734,49 @@ def fetch_quotes_dxlink(token_data, symbols, timeout=25):
     return quotes, diag
 
 
-def fetch_quotes_batched(token_data, symbols, batch_size=200, timeout=25):
+def fetch_quotes_batched(token_data, symbols, batch_size=200, timeout=25,
+                         max_sockets=QUOTE_SOCKETS):
     """Batch DXLink requests (200 symbols per connection); returns merged quotes
-    plus the per-batch diagnostics."""
-    all_quotes, all_diags = {}, []
+    plus the per-batch diagnostics.
+
+    Batches run **concurrently**. Each one blocks for as long as its slowest
+    symbol takes to price — up to the full timeout when a batch contains an
+    illiquid contract that never ticks — so running 25 batches in sequence cost
+    the scan minutes of dead wall-clock. They are independent connections with
+    disjoint symbol sets, so there is nothing to serialise.
+
+    `fetch_quotes_dxlink` blocks its caller and runs its socket loop on the
+    *global* QThreadPool, while `parallel_map` uses a private pool; the two pools
+    are what keep this from deadlocking against itself.
+    """
     sym_list  = list(symbols)
-    n_batches = math.ceil(len(sym_list) / batch_size) if sym_list else 0
-    for i in range(0, len(sym_list), batch_size):
-        batch = sym_list[i:i + batch_size]
-        log.info(f"DXLink batch {i // batch_size + 1}/{n_batches}: {len(batch)} symbols")
-        q, d = fetch_quotes_dxlink(token_data, batch, timeout=timeout)
-        all_quotes.update(q)
-        all_diags.append(d)
+    if not sym_list:
+        return {}, []
+    batches   = [sym_list[i:i + batch_size]
+                 for i in range(0, len(sym_list), batch_size)]
+    n_batches = len(batches)
+
+    if n_batches == 1:
+        # Don't pay for a thread pool to run one socket.
+        q, d = fetch_quotes_dxlink(token_data, batches[0], timeout=timeout)
+        return q, [d]
+
+    workers = max(1, min(max_sockets, n_batches))
+    log.info(f"DXLink: {len(sym_list)} symbols in {n_batches} batches, "
+             f"{workers} sockets in parallel")
+
+    def _one(batch):
+        return fetch_quotes_dxlink(token_data, batch, timeout=timeout)
+
+    all_quotes, all_diags = {}, []
+    for batch, result in parallel_map(_one, batches, max_workers=workers):
+        if isinstance(result, Exception):
+            log.error(f"DXLink batch of {len(batch)} raised: {result}")
+            all_diags.append({'error': str(result)})
+            continue
+        quotes, diag = result
+        all_quotes.update(quotes)
+        all_diags.append(diag)
     return all_quotes, all_diags
 
 
@@ -624,7 +785,13 @@ def fetch_quotes_with_retry(api, symbols, batch_size=200, timeout=25, max_retrie
     a batch connects but never reaches AUTHORIZED.
 
     Returns ``(quotes, diags)``.
+
+    Symbols are de-duplicated first. Setups routinely share legs — two rows on
+    the same ticker and strike, or a position whose back leg is another row's
+    front leg — and paying for the same contract twice inflates both the batch
+    count and the time each batch waits to be fully priced.
     """
+    symbols = list(dict.fromkeys(symbols))       # dedupe, order preserved
     last_result, last_diags = {}, []
     for attempt in range(max_retries + 1):
         token_data = api.get_quote_token()

@@ -128,6 +128,10 @@ class ScanWorker(QThread):
     Doubles as the pipeline's `reporter`: `status` / `progress` / `indeterminate`
     are signal emissions, so the pipeline stays Qt-widget-free while the sidebar
     updates live.
+
+    `only_tickers` switches to a targeted scan of those symbols instead of the
+    watchlist — the single-ticker search. Same pipeline, same signals, so the
+    controller wires it up identically.
     """
 
     statusChanged = Signal(str)
@@ -136,12 +140,18 @@ class ScanWorker(QThread):
     scanFinished = Signal(list)     # list[ScanResult]
     scanFailed = Signal(str)
 
-    def __init__(self, session: ApiSession, settings: dict, parent=None):
+    def __init__(self, session: ApiSession, settings: dict, only_tickers=None,
+                 parent=None):
         super().__init__(parent)
         self._session  = session
         self._settings = dict(settings)
+        self._only     = list(only_tickers) if only_tickers else None
         self._cancel_mutex = QMutex()
         self._cancelled = False
+
+    @property
+    def only_tickers(self):
+        return list(self._only) if self._only else None
 
     # ── reporter protocol (called from this thread) ──
 
@@ -169,7 +179,8 @@ class ScanWorker(QThread):
             return
 
         try:
-            results = run_scan(api, sdk, self._settings, reporter=self)
+            results = run_scan(api, sdk, self._settings, reporter=self,
+                               only_tickers=self._only)
         except ScanAborted as exc:
             self.scanFailed.emit(str(exc))
             return
@@ -194,9 +205,10 @@ class PositionResolveWorker(QThread):
     resolveFinished = Signal()
     resolveFailed = Signal(str)
 
-    def __init__(self, session: ApiSession, positions, parent=None):
+    def __init__(self, session: ApiSession, positions, chain_ttl=0, parent=None):
         super().__init__(parent)
-        self._session = session
+        self._session   = session
+        self._chain_ttl = chain_ttl
         # Copy only what the worker needs — the Position objects themselves stay
         # owned by the GUI thread.
         self._specs = [
@@ -215,7 +227,8 @@ class PositionResolveWorker(QThread):
         for pid, ticker, strike, f_exp, b_exp in self._specs:
             self.statusChanged.emit(f"Resolving {ticker} chain…")
             try:
-                res = resolve_position_legs(api, ticker, strike, f_exp, b_exp)
+                res = resolve_position_legs(api, ticker, strike, f_exp, b_exp,
+                                            cache_ttl=self._chain_ttl)
             except Exception as exc:
                 log.error(f"Position {ticker} chain resolve failed: {exc}")
                 self.positionResolved.emit(pid, '', '', str(exc))

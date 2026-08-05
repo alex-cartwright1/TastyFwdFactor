@@ -125,6 +125,10 @@ DEFAULT_SETTINGS = {
     'filter_back_dividend':    False,
     'filter_unknown_earnings': False,
     'ticker_info_ttl_days':    7,
+    # Option chains are cached in memory only (see api.ChainCache). Expirations
+    # and strikes move slowly, so a short TTL still turns a repeat scan or a
+    # single-ticker search into a no-network lookup.
+    'chain_cache_ttl_min':     30,
 }
 
 IV_METHODS = ("Midpoint", "Bid Front / Ask Back", "Provided Data")

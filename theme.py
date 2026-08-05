@@ -136,6 +136,21 @@ def stylesheet():
         border: 1px solid {T.BORDER_SOFT};
         border-radius: {T.RADIUS}px;
     }}
+    /* Tickers are short and all-caps — monospace keeps them from jittering as
+       the completer rewrites the field. */
+    #TickerSearch {{
+        font-family: {T.MONO};
+        letter-spacing: 0.5px;
+    }}
+    #EmptyState {{
+        background-color: {T.SURFACE};
+        border: 1px solid {T.BORDER_SOFT};
+        border-radius: {T.RADIUS}px;
+        color: {T.TEXT_MUTED};
+        font-size: {T.FONT_SIZE + 1}pt;
+        line-height: 150%;
+        padding: 40px;
+    }}
     #ActionBar {{
         border-radius: {T.RADIUS}px;
     }}

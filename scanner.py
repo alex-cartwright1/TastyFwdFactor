@@ -11,14 +11,17 @@ The phase ordering is a cost optimisation and must not be reordered:
    pre-filter on market cap / earnings / ex-div, so excluded tickers never
    trigger a chain request. The pre-filter uses the *target* DTEs minus a 7-day
    safety buffer because the actual expiry is not yet known.
-2. Option chains for survivors only, then a post-filter that re-checks
-   earnings/dividends against the *actual* front/back expiry dates.
+2. Option chains for survivors only (served from `api.ChainCache` when warm),
+   then a post-filter that re-checks earnings/dividends against the *actual*
+   front/back expiry dates.
 3. Equity quotes via DXLink → pick the ATM strike → option quotes via DXLink.
 4. Metrics.
+
+`run_scan(..., only_tickers=[...])` runs the same pipeline over an explicit
+symbol list with every user filter disabled — that is the single-ticker search.
 """
 
 import os
-import random
 import time
 from datetime import datetime, timedelta
 
@@ -66,7 +69,8 @@ def load_watchlist(path):
 # ─── Tastytrade market metrics: earnings / market cap / ex-dividend ──────────
 
 def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
-                      force_refresh=False, should_cancel=None):
+                      force_refresh=False, should_cancel=None,
+                      on_refreshed=None):
     """Chunked Tastytrade `/market-metrics` fetch backed by an on-disk cache.
 
     Cached entries younger than `ttl_days` are reused without a request. Entries
@@ -77,6 +81,11 @@ def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
     worker thread. Symbols the endpoint doesn't recognise come back absent and
     are cached as an empty `TickerInfo`, so a delisted ticker is not re-requested
     on every scan.
+
+    `on_refreshed(symbols)` fires with the symbols that actually went to the
+    network. `run_scan` hooks the option-chain cache to it: a ticker whose
+    fundamentals just moved is exactly the one whose expirations may have moved
+    too, so its cached chain must not survive.
 
     Returns ``{symbol: TickerInfo}``.
     """
@@ -117,6 +126,8 @@ def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
     # don't record blanks for them — that would suppress the real fetch for a
     # full TTL the next time round.
     cancelled = bool(should_cancel and should_cancel())
+    if on_refreshed and not cancelled:
+        on_refreshed(to_fetch)
     n_unknown = 0
     for sym in to_fetch:
         info = fetched.get(sym)
@@ -145,7 +156,7 @@ def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
 # ─── Option chain structure ──────────────────────────────────────────────────
 
 def get_chain_info(symbol, api, target_front_dte, target_back_dte,
-                   front_dte_flex=0, back_dte_flex=0) -> ChainInfo:
+                   front_dte_flex=0, back_dte_flex=0, cache_ttl=0) -> ChainInfo:
     """Pick the front/back expirations for one symbol.
 
     Always returns a ChainInfo; a rejection carries `skip_reason` rather than
@@ -157,10 +168,9 @@ def get_chain_info(symbol, api, target_front_dte, target_back_dte,
     picked. With flex==0 the "nearest match across all expirations" behaviour is
     used.
     """
-    time.sleep(random.uniform(0.05, 0.15))
     today = datetime.today()
     try:
-        chain_data = api.get_option_chain(symbol)
+        chain_data = api.get_option_chain(symbol, cache_ttl=cache_ttl)
         if not chain_data:
             return ChainInfo(symbol, skip_reason='no_chain_data')
 
@@ -225,13 +235,14 @@ def _streamer_symbol(strike_entry):
     return strike_entry.get('call-streamer-symbol') or strike_entry.get('call', '')
 
 
-def resolve_position_legs(api, ticker, strike, front_expiry, back_expiry):
+def resolve_position_legs(api, ticker, strike, front_expiry, back_expiry,
+                          cache_ttl=0):
     """Look up call-streamer-symbols + DTEs for a manually entered position.
 
     Raises ValueError with a human-readable message if the chain doesn't contain
     a matching expiration or strike.
     """
-    chain_data = api.get_option_chain(ticker)
+    chain_data = api.get_option_chain(ticker, cache_ttl=cache_ttl)
     if not chain_data:
         raise ValueError(f"No option chain returned for {ticker}")
 
@@ -307,13 +318,21 @@ def calculate_calendar_metrics(chain: ChainInfo, option_quotes, iv_method):
 
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 
-def run_scan(api, sdk, settings, reporter=None):
+def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
     """Execute the full scan. Returns a list of ScanResult sorted by fwd factor.
+
+    `only_tickers` runs the same pipeline over an explicit symbol list instead of
+    the watchlist CSV, which is how the single-ticker search works. In that mode
+    **every user filter is skipped** — market cap, earnings, dividends and min
+    price, pre- and post-chain. The user named this symbol; returning "no setups"
+    because it reports earnings next week would hide the very thing they asked to
+    see, and the earnings date is a column on the row anyway.
 
     Raises ScanAborted with a user-facing message when a phase leaves nothing to
     work with.
     """
     rep = reporter or _NullReporter()
+    targeted = bool(only_tickers)
 
     def check_cancel():
         if rep.cancelled():
@@ -326,6 +345,7 @@ def run_scan(api, sdk, settings, reporter=None):
     iv_method = settings['iv_method']
     min_price = float(settings['min_price'])
     ttl_days  = int(settings.get('ticker_info_ttl_days', 7))
+    chain_ttl = max(int(settings.get('chain_cache_ttl_min', 30)), 0) * 60
 
     filter_f_earn  = settings['filter_front_earnings']
     filter_b_earn  = settings['filter_back_earnings']
@@ -340,9 +360,16 @@ def run_scan(api, sdk, settings, reporter=None):
     except ValueError:
         min_cap = 0.0
 
-    tickers, found = load_watchlist(settings['csv_path'])
-    if not found:
-        rep.status(f"'{settings['csv_path']}' not found — using fallback list.")
+    if targeted:
+        tickers = list(dict.fromkeys(t.strip().upper()
+                                     for t in only_tickers if t and t.strip()))
+        if not tickers:
+            raise ScanAborted("No ticker to search for.")
+        log.info(f"Targeted scan: {', '.join(tickers)}")
+    else:
+        tickers, found = load_watchlist(settings['csv_path'])
+        if not found:
+            rep.status(f"'{settings['csv_path']}' not found — using fallback list.")
     total = len(tickers)
 
     # ── Phase 1: ticker info + pre-filter ────────────────────────────────────
@@ -354,9 +381,16 @@ def run_scan(api, sdk, settings, reporter=None):
         rep.progress(int(done / tot * 20))
         rep.status(f"Phase 1/4: Ticker info {done}/{tot}…")
 
+    def _invalidate_chains(symbols):
+        dropped = api.chains.invalidate(symbols)
+        if dropped:
+            log.info(f"Chain cache: dropped {dropped} entries whose fundamentals "
+                     f"were just refreshed")
+
     try:
         info_map = fetch_ticker_info(sdk, tickers, progress_cb=_ep,
-                                     ttl_days=ttl_days, should_cancel=rep.cancelled)
+                                     ttl_days=ttl_days, should_cancel=rep.cancelled,
+                                     on_refreshed=_invalidate_chains)
     except Exception as exc:
         # The filters key off this data, so continuing without it would silently
         # scan tickers the user asked to exclude.
@@ -375,7 +409,7 @@ def run_scan(api, sdk, settings, reporter=None):
 
     survivors = []
     dropped_cap = dropped_earn = dropped_div = dropped_no_earn = 0
-    for t in tickers:
+    for t in (() if targeted else tickers):
         info = info_map.get(t) or TickerInfo()
         if min_cap > 0 and (info.market_cap is None or info.market_cap < min_cap):
             dropped_cap += 1
@@ -392,6 +426,9 @@ def run_scan(api, sdk, settings, reporter=None):
             dropped_div += 1
             continue
         survivors.append(t)
+
+    if targeted:
+        survivors = list(tickers)
 
     n_dropped = dropped_cap + dropped_earn + dropped_div + dropped_no_earn
     if n_dropped:
@@ -411,7 +448,8 @@ def run_scan(api, sdk, settings, reporter=None):
              f"front_dte={f_dte}±{f_flex}  back_dte={b_dte}±{b_flex}")
 
     def _fetch_chain(sym):
-        return get_chain_info(sym, api, f_dte, b_dte, f_flex, b_flex)
+        return get_chain_info(sym, api, f_dte, b_dte, f_flex, b_flex,
+                              cache_ttl=chain_ttl)
 
     def _cp(done, tot):
         if done % 10 == 0 or done == tot:
@@ -432,6 +470,10 @@ def run_scan(api, sdk, settings, reporter=None):
     log.info(f"Phase 2 done: {len(chains)} valid, skips={skip_reasons}")
     if not chains:
         reasons = ', '.join(f'{k}:{v}' for k, v in sorted(skip_reasons.items()))
+        if targeted:
+            raise ScanAborted(
+                f"{', '.join(tickers)}: no usable option chain for "
+                f"{f_dte}/{b_dte} DTE ({reasons or 'unknown'}).")
         raise ScanAborted(f"No valid option chains found. Reasons: {reasons or 'unknown'}")
 
     for ticker, chain in chains.items():
@@ -449,11 +491,11 @@ def run_scan(api, sdk, settings, reporter=None):
         if removed:
             log.info(f"{label} post-filter removed {len(removed)}; {len(chains)} remain")
 
-    if filter_f_earn or filter_b_earn:
+    if not targeted and (filter_f_earn or filter_b_earn):
         post_filter(lambda c: c.earnings_date and (
             (filter_f_earn and c.earnings_date <= c.front_exp_date) or
             (filter_b_earn and c.earnings_date <= c.back_exp_date)), "Earnings")
-    if filter_f_div or filter_b_div:
+    if not targeted and (filter_f_div or filter_b_div):
         post_filter(lambda c: c.ex_div_date and (
             (filter_f_div and c.ex_div_date <= c.front_exp_date) or
             (filter_b_div and c.ex_div_date <= c.back_exp_date)), "Dividend")
@@ -519,7 +561,7 @@ def run_scan(api, sdk, settings, reporter=None):
 
     results = []
     for chain in chains.values():
-        if chain.current_price < min_price:
+        if not targeted and chain.current_price < min_price:
             continue
         r = calculate_calendar_metrics(chain, opt_quotes, iv_method)
         if r:
