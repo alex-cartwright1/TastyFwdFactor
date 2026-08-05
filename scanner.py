@@ -7,32 +7,59 @@ emissions.
 
 The phase ordering is a cost optimisation and must not be reordered:
 
-1. Ticker info (yfinance, concurrent, disk-cached with TTL) → pre-filter on
-   market cap / earnings / ex-div, so excluded tickers never trigger a chain
-   request. The pre-filter uses the *target* DTEs minus a 7-day safety buffer
-   because the actual expiry is not yet known.
-2. Option chains for survivors only, then a post-filter that re-checks
-   earnings/dividends against the *actual* front/back expiry dates.
+1. Ticker info (Tastytrade `/market-metrics`, chunked, disk-cached with TTL) →
+   pre-filter on market cap / earnings / ex-div, so excluded tickers never
+   trigger a chain request. The pre-filter uses the *target* DTEs minus a 7-day
+   safety buffer because the actual expiry is not yet known.
+2. Option chains for survivors only (served from `api.ChainCache` when warm),
+   then a post-filter that re-checks earnings/dividends against the *actual*
+   front/back expiry dates.
 3. Equity quotes via DXLink → pick the ATM strike → option quotes via DXLink.
 4. Metrics.
+
+Phase 3 subscribes on the app's **persistent** `api.QuoteStream` rather than
+opening its own sockets: it adds symbols to the live connection as it identifies
+them and blocks on the shared `QuoteStore` until they price. Nothing is torn down
+at the end, so the results table is already streaming the moment it is painted.
+`fetch_quotes_with_retry` remains as the fallback for when no stream is available.
+
+`run_scan(..., only_tickers=[...])` runs the same pipeline over an explicit
+symbol list with every user filter disabled — that is the single-ticker search.
 """
 
 import os
-import random
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-import yfinance as yf
-
-from api import describe_diags, fetch_quotes_with_retry
+from api import (
+    QUOTE_COVERAGE, QUOTE_QUIET_SECS, describe_diags, fetch_quotes_with_retry,
+)
 from applog import log
-from config import load_ticker_cache, parse_iso_date, save_ticker_cache
-from data_models import ChainInfo, Quote, ScanResult
+from config import (
+    DEFAULT_SETTINGS, load_ticker_cache, parse_iso_date, save_ticker_cache,
+)
+from data_models import ChainInfo, Quote, ScanResult, TickerInfo
 from pricing import solve_calendar
 from qtpool import parallel_map
 
 FALLBACK_TICKERS = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'IWM', 'AMD']
+
+# Phase 2 fan-out ceiling. Chain fetches are pure network wait, so the useful
+# worker count is bounded by the API's rate limiter, not by cores — but it must
+# not exceed `api.HTTP_POOL_SIZE`, or the surplus workers queue on the shared
+# `requests` connection pool and buy nothing.
+CHAIN_WORKERS_DEFAULT = 35
+CHAIN_WORKERS_MAX     = 50
+
+# The consumer name Phase 3 registers on the shared stream. `MainWindow` releases
+# it once the results table has declared its own set, so nothing the scan
+# subscribed outlives the scan.
+SCAN_CONSUMER = "scan"
+
+# Chain-cache TTL for call sites that aren't handed the user's settings — the
+# position leg resolver. `run_scan` reads `chain_cache_ttl_days` itself.
+DEFAULT_CHAIN_TTL_SECS = max(
+    int(DEFAULT_SETTINGS.get('chain_cache_ttl_days', 7)), 0) * 86400
 
 
 class ScanAborted(Exception):
@@ -66,79 +93,26 @@ def load_watchlist(path):
     return tickers, True
 
 
-# ─── yfinance: earnings / market cap / ex-dividend ───────────────────────────
+# ─── Tastytrade market metrics: earnings / market cap / ex-dividend ──────────
 
-def _calendar_dates(cal, key):
-    """Pull a list of dates out of a yfinance calendar (handles dict / DataFrame)."""
-    if cal is None:
-        return []
-    try:
-        if hasattr(cal, 'loc') and hasattr(cal, 'index'):
-            return cal.loc[key].tolist() if key in cal.index else []
-        return cal.get(key, []) or []
-    except Exception:
-        return []
+def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
+                      force_refresh=False, should_cancel=None,
+                      on_refreshed=None):
+    """Chunked Tastytrade `/market-metrics` fetch backed by an on-disk cache.
 
-
-def _next_future_date(candidates, today):
-    """First date in candidates that is >= today; returns date or None."""
-    if not isinstance(candidates, (list, tuple)):
-        candidates = [candidates]
-    for d in candidates:
-        if hasattr(d, 'date'):
-            d = d.date()
-        elif isinstance(d, (int, float)):
-            try:
-                d = datetime.fromtimestamp(d).date()
-            except (ValueError, OSError):
-                continue
-        if hasattr(d, 'year') and d >= today:
-            return d
-    return None
-
-
-@dataclass
-class TickerInfo:
-    earnings:   object = None      # datetime.date | None
-    market_cap: object = None      # float | None
-    ex_div:     object = None      # datetime.date | None
-
-
-def _fetch_single_ticker_info(symbol):
-    today = datetime.today().date()
-    info_out = TickerInfo()
-    try:
-        t    = yf.Ticker(symbol)
-        cal  = t.calendar
-        info = t.info
-        info_out.market_cap = info.get('marketCap')
-
-        # Earnings: prefer calendar, fall back to info
-        earnings = _next_future_date(_calendar_dates(cal, 'Earnings Date'), today)
-        if earnings is None:
-            ed = info.get('earningsDate') or info.get('earningsTimestamps')
-            earnings = _next_future_date(ed, today)
-        info_out.earnings = earnings
-
-        # Ex-dividend: same approach. info['exDividendDate'] is a unix timestamp
-        # of the *most recent* ex-div in many versions of yfinance, so filter by
-        # today before accepting it.
-        ex_div = _next_future_date(_calendar_dates(cal, 'Ex-Dividend Date'), today)
-        if ex_div is None:
-            ex_div = _next_future_date(info.get('exDividendDate'), today)
-        info_out.ex_div = ex_div
-    except Exception:
-        pass
-    return info_out
-
-
-def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
-                      ttl_days=7, force_refresh=False, should_cancel=None):
-    """Concurrent yfinance fetch backed by an on-disk cache.
-
-    Cached entries younger than `ttl_days` are reused without scraping. Entries
+    Cached entries younger than `ttl_days` are reused without a request. Entries
     whose cached earnings/ex-div date has already passed are re-fetched, since
-    yfinance may have rolled forward to the next event.
+    the endpoint will have rolled forward to the next event.
+
+    `sdk` is an `api.MarketDataSession`; the fetch blocks, so this must run on a
+    worker thread. Symbols the endpoint doesn't recognise come back absent and
+    are cached as an empty `TickerInfo`, so a delisted ticker is not re-requested
+    on every scan.
+
+    `on_refreshed(symbols)` fires with the symbols that actually went to the
+    network. `run_scan` hooks the option-chain cache to it: a ticker whose
+    fundamentals just moved is exactly the one whose expirations may have moved
+    too, so its cached chain must not survive.
 
     Returns ``{symbol: TickerInfo}``.
     """
@@ -162,9 +136,12 @@ def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
 
     n_cached = len(symbols) - len(to_fetch)
     if to_fetch:
-        log.info(f"Ticker info: {n_cached} from cache, {len(to_fetch)} to scrape")
+        log.info(f"Ticker info: {n_cached} from cache, {len(to_fetch)} to fetch")
     else:
-        log.info(f"Ticker info: all {n_cached} from cache")
+        # Nothing went to the network, so nothing in `cache` changed. Rewriting
+        # ticker_info.json here would serialise thousands of untouched entries on
+        # every warm scan for no effect at all.
+        log.info(f"Ticker info: all {n_cached} from cache — no disk write needed")
         if progress_cb:
             progress_cb(len(symbols), len(symbols))
         return out
@@ -173,11 +150,23 @@ def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
         if progress_cb:
             progress_cb(n_cached + done, len(symbols))
 
-    for sym, info in parallel_map(_fetch_single_ticker_info, to_fetch,
-                                  max_workers=max_workers, progress_cb=_report,
-                                  should_cancel=should_cancel):
-        if isinstance(info, Exception):
-            log.debug(f"Ticker info {sym} failed: {info}")
+    fetched = sdk.fetch_ticker_info(to_fetch, progress_cb=_report,
+                                    should_cancel=should_cancel)
+    # A cancelled sweep leaves most symbols unrequested rather than unknown, so
+    # don't record blanks for them — that would suppress the real fetch for a
+    # full TTL the next time round.
+    cancelled = bool(should_cancel and should_cancel())
+    if on_refreshed and not cancelled:
+        on_refreshed(to_fetch)
+    n_unknown = n_written = 0
+    for sym in to_fetch:
+        info = fetched.get(sym)
+        if info is None:
+            if cancelled:
+                continue
+            # Not an error: /market-metrics simply has no row for delisted or
+            # non-equity symbols. Cache the blank so the next scan skips it.
+            n_unknown += 1
             info = TickerInfo()
         out[sym] = info
         cache[sym] = {
@@ -186,15 +175,25 @@ def fetch_ticker_info(symbols, max_workers=15, progress_cb=None,
             'ex_div':     info.ex_div.isoformat() if info.ex_div else None,
             'fetched_at': fetched_at,
         }
+        n_written += 1
 
-    save_ticker_cache(cache)
+    if n_unknown:
+        log.info(f"Ticker info: {n_unknown}/{len(to_fetch)} symbols unknown to "
+                 f"/market-metrics")
+    # Only write when the sweep actually produced entries. A cancelled sweep can
+    # reach here having recorded none, and rewriting the whole file to change
+    # nothing is the most expensive no-op in the pipeline.
+    if n_written:
+        save_ticker_cache(cache)
+    else:
+        log.info("Ticker info: nothing new recorded — cache left untouched")
     return out
 
 
 # ─── Option chain structure ──────────────────────────────────────────────────
 
 def get_chain_info(symbol, api, target_front_dte, target_back_dte,
-                   front_dte_flex=0, back_dte_flex=0) -> ChainInfo:
+                   front_dte_flex=0, back_dte_flex=0, cache_ttl=0) -> ChainInfo:
     """Pick the front/back expirations for one symbol.
 
     Always returns a ChainInfo; a rejection carries `skip_reason` rather than
@@ -206,10 +205,9 @@ def get_chain_info(symbol, api, target_front_dte, target_back_dte,
     picked. With flex==0 the "nearest match across all expirations" behaviour is
     used.
     """
-    time.sleep(random.uniform(0.05, 0.15))
     today = datetime.today()
     try:
-        chain_data = api.get_option_chain(symbol)
+        chain_data = api.get_option_chain(symbol, cache_ttl=cache_ttl)
         if not chain_data:
             return ChainInfo(symbol, skip_reason='no_chain_data')
 
@@ -274,13 +272,21 @@ def _streamer_symbol(strike_entry):
     return strike_entry.get('call-streamer-symbol') or strike_entry.get('call', '')
 
 
-def resolve_position_legs(api, ticker, strike, front_expiry, back_expiry):
+def resolve_position_legs(api, ticker, strike, front_expiry, back_expiry,
+                          cache_ttl=None):
     """Look up call-streamer-symbols + DTEs for a manually entered position.
+
+    `cache_ttl` defaults to the configured chain-cache TTL rather than 0: a
+    position's chain is almost always one a recent scan already fetched, and
+    forcing a refetch put a multi-second network round trip in front of every
+    add/edit and every launch that restores positions.
 
     Raises ValueError with a human-readable message if the chain doesn't contain
     a matching expiration or strike.
     """
-    chain_data = api.get_option_chain(ticker)
+    if cache_ttl is None:
+        cache_ttl = DEFAULT_CHAIN_TTL_SECS
+    chain_data = api.get_option_chain(ticker, cache_ttl=cache_ttl)
     if not chain_data:
         raise ValueError(f"No option chain returned for {ticker}")
 
@@ -356,13 +362,59 @@ def calculate_calendar_metrics(chain: ChainInfo, option_quotes, iv_method):
 
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 
-def run_scan(api, settings, reporter=None):
+def _stream_quotes(stream, api, subscribe, trade_syms, wait_for, predicate,
+                   timeout, label):
+    """Price `wait_for` on the persistent stream, falling back to a one-shot fetch.
+
+    `subscribe` is the scan's **cumulative** symbol set — Phase 3b passes 3a's
+    equities along with the option legs, so the underlying prices keep ticking
+    while the legs are being priced, and the results table inherits both.
+
+    Blocks on the shared store until `QuoteStore.wait_for`'s coverage or
+    quiet-period condition is met. Nothing is closed afterwards.
+
+    Returns ``(quotes, diags)``. `diags` is empty on the streaming path; it only
+    carries content when the fallback ran, which is what `describe_diags` reads.
+    """
+    if stream is not None:
+        stream.ensure_started()
+    if stream is None or not stream.wait_ready():
+        log.warning(f"{label}: persistent quote stream unavailable — falling "
+                    f"back to a one-shot DXLink fetch")
+        return fetch_quotes_with_retry(api, list(wait_for), timeout=timeout)
+
+    stream.set_consumer(SCAN_CONSUMER, subscribe, trade_syms)
+
+    wanted  = list(wait_for)
+    started = time.monotonic()
+    priced  = stream.store.wait_for(wanted, predicate, timeout)
+    log.info(f"{label}: {priced}/{len(wanted)} priced in "
+             f"{time.monotonic() - started:.1f}s "
+             f"(coverage target {QUOTE_COVERAGE:.0%}, "
+             f"quiet period {QUOTE_QUIET_SECS}s, timeout {timeout}s)")
+    return stream.store.snapshot(wanted), []
+
+
+def run_scan(api, sdk, settings, reporter=None, only_tickers=None, stream=None):
     """Execute the full scan. Returns a list of ScanResult sorted by fwd factor.
+
+    `stream` is the app's `api.QuoteStream`. Phase 3 subscribes on it instead of
+    opening its own sockets and leaves the subscription in place, so the results
+    table inherits a feed that is already warm. Passing None (or a stream that
+    never becomes ready) falls back to the one-shot batched fetch.
+
+    `only_tickers` runs the same pipeline over an explicit symbol list instead of
+    the watchlist CSV, which is how the single-ticker search works. In that mode
+    **every user filter is skipped** — market cap, earnings, dividends and min
+    price, pre- and post-chain. The user named this symbol; returning "no setups"
+    because it reports earnings next week would hide the very thing they asked to
+    see, and the earnings date is a column on the row anyway.
 
     Raises ScanAborted with a user-facing message when a phase leaves nothing to
     work with.
     """
     rep = reporter or _NullReporter()
+    targeted = bool(only_tickers)
 
     def check_cancel():
         if rep.cancelled():
@@ -375,6 +427,13 @@ def run_scan(api, settings, reporter=None):
     iv_method = settings['iv_method']
     min_price = float(settings['min_price'])
     ttl_days  = int(settings.get('ticker_info_ttl_days', 7))
+    chain_ttl = max(int(settings.get('chain_cache_ttl_days', 7)), 0) * 86400
+    try:
+        chain_workers = int(settings.get('chain_fetch_workers',
+                                         CHAIN_WORKERS_DEFAULT))
+    except (TypeError, ValueError):
+        chain_workers = CHAIN_WORKERS_DEFAULT
+    chain_workers = max(1, min(chain_workers, CHAIN_WORKERS_MAX))
 
     filter_f_earn  = settings['filter_front_earnings']
     filter_b_earn  = settings['filter_back_earnings']
@@ -389,9 +448,16 @@ def run_scan(api, settings, reporter=None):
     except ValueError:
         min_cap = 0.0
 
-    tickers, found = load_watchlist(settings['csv_path'])
-    if not found:
-        rep.status(f"'{settings['csv_path']}' not found — using fallback list.")
+    if targeted:
+        tickers = list(dict.fromkeys(t.strip().upper()
+                                     for t in only_tickers if t and t.strip()))
+        if not tickers:
+            raise ScanAborted("No ticker to search for.")
+        log.info(f"Targeted scan: {', '.join(tickers)}")
+    else:
+        tickers, found = load_watchlist(settings['csv_path'])
+        if not found:
+            rep.status(f"'{settings['csv_path']}' not found — using fallback list.")
     total = len(tickers)
 
     # ── Phase 1: ticker info + pre-filter ────────────────────────────────────
@@ -403,8 +469,21 @@ def run_scan(api, settings, reporter=None):
         rep.progress(int(done / tot * 20))
         rep.status(f"Phase 1/4: Ticker info {done}/{tot}…")
 
-    info_map = fetch_ticker_info(tickers, progress_cb=_ep, ttl_days=ttl_days,
-                                 should_cancel=rep.cancelled)
+    def _invalidate_chains(symbols):
+        dropped = api.chains.invalidate(symbols)
+        if dropped:
+            log.info(f"Chain cache: dropped {dropped} entries whose fundamentals "
+                     f"were just refreshed")
+
+    try:
+        info_map = fetch_ticker_info(sdk, tickers, progress_cb=_ep,
+                                     ttl_days=ttl_days, should_cancel=rep.cancelled,
+                                     on_refreshed=_invalidate_chains)
+    except Exception as exc:
+        # The filters key off this data, so continuing without it would silently
+        # scan tickers the user asked to exclude.
+        log.error(f"Ticker info fetch failed: {exc}")
+        raise ScanAborted(f"Could not fetch ticker info from Tastytrade: {exc}")
     check_cancel()
 
     # Conservative pre-filter cutoffs: the actual front/back expirations may
@@ -418,7 +497,7 @@ def run_scan(api, settings, reporter=None):
 
     survivors = []
     dropped_cap = dropped_earn = dropped_div = dropped_no_earn = 0
-    for t in tickers:
+    for t in (() if targeted else tickers):
         info = info_map.get(t) or TickerInfo()
         if min_cap > 0 and (info.market_cap is None or info.market_cap < min_cap):
             dropped_cap += 1
@@ -436,6 +515,9 @@ def run_scan(api, settings, reporter=None):
             continue
         survivors.append(t)
 
+    if targeted:
+        survivors = list(tickers)
+
     n_dropped = dropped_cap + dropped_earn + dropped_div + dropped_no_earn
     if n_dropped:
         log.info(f"Pre-filter dropped: market_cap={dropped_cap} earnings={dropped_earn} "
@@ -451,17 +533,19 @@ def run_scan(api, settings, reporter=None):
     rep.status(f"Phase 2/4: Fetching option chains ({len(survivors)} tickers)…")
     rep.progress(20)
     log.info(f"Phase 2: chain fetch for {len(survivors)} survivors  "
-             f"front_dte={f_dte}±{f_flex}  back_dte={b_dte}±{b_flex}")
+             f"front_dte={f_dte}±{f_flex}  back_dte={b_dte}±{b_flex}  "
+             f"workers={chain_workers}")
 
     def _fetch_chain(sym):
-        return get_chain_info(sym, api, f_dte, b_dte, f_flex, b_flex)
+        return get_chain_info(sym, api, f_dte, b_dte, f_flex, b_flex,
+                              cache_ttl=chain_ttl)
 
     def _cp(done, tot):
         if done % 10 == 0 or done == tot:
             rep.progress(20 + int(done / tot * 30))
 
     chains, skip_reasons = {}, {}
-    for sym, chain in parallel_map(_fetch_chain, survivors, max_workers=10,
+    for sym, chain in parallel_map(_fetch_chain, survivors, max_workers=chain_workers,
                                    progress_cb=_cp, should_cancel=rep.cancelled):
         if isinstance(chain, Exception):
             chain = ChainInfo(sym, skip_reason=f'exception:{chain}')
@@ -473,8 +557,25 @@ def run_scan(api, settings, reporter=None):
 
     check_cancel()
     log.info(f"Phase 2 done: {len(chains)} valid, skips={skip_reasons}")
+    cache_stats = api.chains.stats()
+    log.info(f"Chain cache: {cache_stats}")
+    rate_stats = getattr(api, 'rate', None)
+    if rate_stats is not None:
+        log.info(f"Chain pacing: {rate_stats.stats()}")
+    if cache_stats.get('evictions'):
+        # The cap is the only reason a warm rescan would refetch, so say so
+        # rather than leaving the user to infer it from the phase timing.
+        log.warning(
+            f"Chain cache evicted {cache_stats['evictions']} entries — the "
+            f"{cache_stats['max']}-entry cap is smaller than this sweep "
+            f"({len(survivors)} survivors), so the next scan will refetch the "
+            f"difference. Narrow the pre-filter or raise api.CHAIN_CACHE_MAX.")
     if not chains:
         reasons = ', '.join(f'{k}:{v}' for k, v in sorted(skip_reasons.items()))
+        if targeted:
+            raise ScanAborted(
+                f"{', '.join(tickers)}: no usable option chain for "
+                f"{f_dte}/{b_dte} DTE ({reasons or 'unknown'}).")
         raise ScanAborted(f"No valid option chains found. Reasons: {reasons or 'unknown'}")
 
     for ticker, chain in chains.items():
@@ -492,11 +593,11 @@ def run_scan(api, settings, reporter=None):
         if removed:
             log.info(f"{label} post-filter removed {len(removed)}; {len(chains)} remain")
 
-    if filter_f_earn or filter_b_earn:
+    if not targeted and (filter_f_earn or filter_b_earn):
         post_filter(lambda c: c.earnings_date and (
             (filter_f_earn and c.earnings_date <= c.front_exp_date) or
             (filter_b_earn and c.earnings_date <= c.back_exp_date)), "Earnings")
-    if filter_f_div or filter_b_div:
+    if not targeted and (filter_f_div or filter_b_div):
         post_filter(lambda c: c.ex_div_date and (
             (filter_f_div and c.ex_div_date <= c.front_exp_date) or
             (filter_b_div and c.ex_div_date <= c.back_exp_date)), "Dividend")
@@ -510,7 +611,15 @@ def run_scan(api, settings, reporter=None):
     rep.indeterminate(True)
     log.info(f"Phase 3a: {len(equity_syms)} equity symbols")
 
-    eq_quotes, eq_diags = fetch_quotes_with_retry(api, equity_syms, timeout=25)
+    eq_quotes, eq_diags = _stream_quotes(
+        stream, api,
+        subscribe  = set(equity_syms),
+        trade_syms = set(equity_syms),
+        wait_for   = equity_syms,
+        predicate  = lambda q: q.price > 0,
+        timeout    = 25,
+        label      = "Phase 3a equity quotes",
+    )
     rep.indeterminate(False)
     check_cancel()
 
@@ -540,15 +649,27 @@ def run_scan(api, settings, reporter=None):
         option_syms.update(s for s in (chain.front_sym, chain.back_sym) if s)
 
     if not option_syms:
-        raise ScanAborted(
-            f"No equity prices from DXLink ({describe_diags(eq_diags)}). See Debug Log.")
+        # eq_diags is only populated by the one-shot fallback; on the streaming
+        # path there is no per-socket diagnostic to quote, just an empty feed.
+        why = describe_diags(eq_diags) if eq_diags else "no quotes arrived on the live stream"
+        raise ScanAborted(f"No equity prices from DXLink ({why}). See Debug Log.")
 
     # ── Phase 3b: option quotes ──────────────────────────────────────────────
     rep.status(f"Phase 3/4: Option quotes ({len(option_syms)} contracts)…")
     rep.indeterminate(True)
     log.info(f"Phase 3b: {len(option_syms)} option symbols")
 
-    opt_quotes, _ = fetch_quotes_with_retry(api, list(option_syms), timeout=30)
+    opt_quotes, _ = _stream_quotes(
+        stream, api,
+        # Cumulative: the equities stay subscribed so the table's Price column is
+        # live the instant it is painted, not one flush behind.
+        subscribe  = set(equity_syms) | option_syms,
+        trade_syms = set(equity_syms),
+        wait_for   = option_syms,
+        predicate  = lambda q: q.bid > 0,
+        timeout    = 30,
+        label      = "Phase 3b option quotes",
+    )
     rep.indeterminate(False)
     check_cancel()
 
@@ -562,7 +683,7 @@ def run_scan(api, settings, reporter=None):
 
     results = []
     for chain in chains.values():
-        if chain.current_price < min_price:
+        if not targeted and chain.current_price < min_price:
             continue
         r = calculate_calendar_metrics(chain, opt_quotes, iv_method)
         if r:

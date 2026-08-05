@@ -122,11 +122,23 @@ class FiltersDialog(QDialog):
             settings.get('filter_unknown_earnings', False), root)
 
         root.addWidget(self._separator())
-        cache_box = QGroupBox("Ticker Info Cache")
+        cache_box = QGroupBox("Caches")
         cache_layout = QVBoxLayout(cache_box)
         ttl_form = QFormLayout()
         self.ttl_days = self._int_spin(int(settings.get('ticker_info_ttl_days', 7)), 0, 365)
-        ttl_form.addRow("Refresh after (days, 0 = always):", self.ttl_days)
+        ttl_form.addRow("Ticker info: refresh after (days, 0 = always):",
+                        self.ttl_days)
+        self.chain_ttl_days = self._int_spin(
+            int(settings.get('chain_cache_ttl_days', 7)), 0, 90)
+        self.chain_ttl_days.setToolTip(
+            "Option chains are cached on disk and survive a restart, so a repeat "
+            "scan or a single-ticker search skips the REST round trip entirely.\n"
+            "0 disables the cache.\n\n"
+            "Longer is faster but staler: a cached chain won't include "
+            "expirations listed since it was fetched, and if the underlying has "
+            "moved a long way the strike nearest the money may not be in it.")
+        ttl_form.addRow("Option chains: keep for (days, 0 = off):",
+                        self.chain_ttl_days)
         cache_layout.addLayout(ttl_form)
         refresh_btn = QPushButton("Refresh ticker data now (clear cache)")
         refresh_btn.clicked.connect(self._refresh_cache)
@@ -188,7 +200,7 @@ class FiltersDialog(QDialog):
         clear_ticker_cache()
         QMessageBox.information(
             self, "Cache cleared",
-            "Ticker info cache cleared. The next scan will re-scrape earnings, "
+            "Ticker info cache cleared. The next scan will refetch earnings, "
             "dividends and market caps for all tickers.")
 
     # ── result ──
@@ -222,6 +234,7 @@ class FiltersDialog(QDialog):
             'filter_back_dividend':    self.b_div.isChecked(),
             'filter_unknown_earnings': self.no_earn.isChecked(),
             'ticker_info_ttl_days':    self.ttl_days.value(),
+            'chain_cache_ttl_days':    self.chain_ttl_days.value(),
         })
         save_settings(self._settings)
         self.accept()

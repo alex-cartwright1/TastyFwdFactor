@@ -6,31 +6,72 @@ results reach the GUI is a signal. No widget is ever touched from these classes.
 
 from PySide6.QtCore import QMutex, QMutexLocker, QObject, QThread, Signal
 
-from api import TastytradeAPI
+from api import MarketDataSession, TastytradeAPI
 from applog import log
+from config import load_settings
 from scanner import ScanAborted, resolve_position_legs, run_scan
 
 
+def _settings_chain_ttl():
+    """Chain-cache TTL in seconds from the saved settings, for the API instance
+    built before any view has passed its own value down."""
+    try:
+        days = int(load_settings().get('chain_cache_ttl_days', 7))
+    except Exception as exc:
+        log.debug(f"Chain TTL from settings failed ({exc}); using the default")
+        days = 7
+    return max(days, 0) * 86400
+
+
 class ApiSession(QObject):
-    """Lazily-built, shared `TastytradeAPI`.
+    """Lazily-built, shared `TastytradeAPI` plus `MarketDataSession`.
 
     One instance is shared by the scan worker, the position resolver and both
     live clients, so construction is mutex-protected. `ensure()` performs an
-    OAuth round trip and must only be called from a worker thread.
+    OAuth round trip and must only be called from a worker thread; so must
+    `ensure_sdk()`, whose first call builds the SDK's event-loop thread.
+
+    Both clients are backed by the same OAuth grant — the hand-rolled
+    `TastytradeAPI` for chains and quote tokens, the SDK for reference data —
+    so a credential change has to invalidate both together.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._api    = None
+        self._sdk    = None
         self._mutex  = QMutex()
         self._secret = ''
         self._refresh = ''
+        # Chain-cache TTL in seconds, needed at TastytradeAPI construction so the
+        # on-disk cache can be seeded (and expired entries dropped) up front.
+        # Seeded from the saved settings rather than 0: the login screen builds
+        # the API before any window has had a chance to call `set_chain_ttl`, so
+        # defaulting to 0 meant that instance loaded nothing from disk and the
+        # first scan of every launch refetched the whole watchlist.
+        self._chain_ttl = _settings_chain_ttl()
+
+    def set_chain_ttl(self, seconds):
+        ttl = max(int(seconds), 0)
+        with QMutexLocker(self._mutex):
+            self._chain_ttl = ttl
+            api = self._api
+        # If the API already exists it was built with the old TTL, so its cache
+        # may never have been seeded. Load it now — `import_entries` tops the
+        # cache up rather than replacing this session's fetches.
+        if api is not None and ttl > 0 and not api.chains.loaded_from_disk:
+            try:
+                api._load_chains(ttl)
+            except Exception as exc:
+                log.warning(f"Could not seed chain cache from disk: {exc}")
+        return self
 
     def set_credentials(self, client_secret, refresh_token):
         with QMutexLocker(self._mutex):
             if (client_secret, refresh_token) != (self._secret, self._refresh):
                 self._secret, self._refresh = client_secret, refresh_token
                 self._api = None      # force re-auth with the new grant
+                self._close_sdk_locked()
         return self
 
     @property
@@ -49,12 +90,44 @@ class ApiSession(QObject):
                 return self._api
             if not (self._secret and self._refresh):
                 raise RuntimeError("Tastytrade OAuth credentials are not set")
-            self._api = TastytradeAPI(self._secret, self._refresh)
+            self._api = TastytradeAPI(self._secret, self._refresh,
+                                      chain_ttl_secs=self._chain_ttl)
             return self._api
 
+    def ensure_sdk(self) -> MarketDataSession:
+        """Shared `tastytrade` SDK session. Worker threads only — the first call
+        starts the SDK's private event-loop thread and later calls block on it."""
+        with QMutexLocker(self._mutex):
+            if self._sdk is not None:
+                return self._sdk
+            if not (self._secret and self._refresh):
+                raise RuntimeError("Tastytrade OAuth credentials are not set")
+            self._sdk = MarketDataSession(self._secret, self._refresh)
+            return self._sdk
+
+    def _close_sdk_locked(self):
+        """Tear the SDK loop down. Caller must hold the mutex."""
+        if self._sdk is not None:
+            try:
+                self._sdk.close()
+            except Exception as exc:
+                log.debug(f"SDK session shutdown: {exc}")
+            self._sdk = None
+
+    def save_chain_cache(self):
+        """Persist the option-chain cache if it changed. No-op when nothing has
+        been fetched yet."""
+        api = self.peek()
+        if api is not None:
+            api.save_chains()
+
     def reset(self):
+        # Outside the mutex, and before the instance is dropped — this is the
+        # last chance to keep a session's worth of chain fetches.
+        self.save_chain_cache()
         with QMutexLocker(self._mutex):
             self._api = None
+            self._close_sdk_locked()
 
 
 class AuthWorker(QThread):
@@ -100,6 +173,10 @@ class ScanWorker(QThread):
     Doubles as the pipeline's `reporter`: `status` / `progress` / `indeterminate`
     are signal emissions, so the pipeline stays Qt-widget-free while the sidebar
     updates live.
+
+    `only_tickers` switches to a targeted scan of those symbols instead of the
+    watchlist — the single-ticker search. Same pipeline, same signals, so the
+    controller wires it up identically.
     """
 
     statusChanged = Signal(str)
@@ -108,12 +185,21 @@ class ScanWorker(QThread):
     scanFinished = Signal(list)     # list[ScanResult]
     scanFailed = Signal(str)
 
-    def __init__(self, session: ApiSession, settings: dict, parent=None):
+    def __init__(self, session: ApiSession, settings: dict, only_tickers=None,
+                 stream=None, parent=None):
         super().__init__(parent)
         self._session  = session
         self._settings = dict(settings)
+        self._only     = list(only_tickers) if only_tickers else None
+        # The app's shared api.QuoteStream. Phase 3 subscribes on it rather than
+        # opening its own sockets, and leaves the subscription up for the table.
+        self._stream   = stream
         self._cancel_mutex = QMutex()
         self._cancelled = False
+
+    @property
+    def only_tickers(self):
+        return list(self._only) if self._only else None
 
     # ── reporter protocol (called from this thread) ──
 
@@ -135,12 +221,14 @@ class ScanWorker(QThread):
         try:
             self.statusChanged.emit("Authenticating with Tastytrade (OAuth)…")
             api = self._session.ensure()
+            sdk = self._session.ensure_sdk()
         except Exception as exc:
             self.scanFailed.emit(f"Auth Error: {exc}")
             return
 
         try:
-            results = run_scan(api, self._settings, reporter=self)
+            results = run_scan(api, sdk, self._settings, reporter=self,
+                               only_tickers=self._only, stream=self._stream)
         except ScanAborted as exc:
             self.scanFailed.emit(str(exc))
             return
@@ -148,8 +236,17 @@ class ScanWorker(QThread):
             log.error(f"Scan crashed: {exc}")
             self.scanFailed.emit(f"Scan failed: {exc}")
             return
-
-        self.scanFinished.emit(results)
+        else:
+            self.scanFinished.emit(results)
+        finally:
+            # Persist whatever Phase 2 fetched, on this thread rather than the
+            # GUI's — a wide sweep is several MB. In `finally` because a cancelled
+            # or failed scan has usually still fetched thousands of chains, and
+            # throwing them away would mean refetching them all next time.
+            try:
+                api.save_chains()
+            except Exception as exc:
+                log.warning(f"Could not persist chain cache: {exc}")
 
 
 class PositionResolveWorker(QThread):
@@ -165,9 +262,13 @@ class PositionResolveWorker(QThread):
     resolveFinished = Signal()
     resolveFailed = Signal(str)
 
-    def __init__(self, session: ApiSession, positions, parent=None):
+    def __init__(self, session: ApiSession, positions, chain_ttl=None, parent=None):
         super().__init__(parent)
         self._session = session
+        # Opening or editing a position used to bypass the cache entirely and
+        # refetch the ticker's whole chain; the configured TTL applies here too.
+        self._chain_ttl = (_settings_chain_ttl() if chain_ttl is None
+                           else max(int(chain_ttl), 0))
         # Copy only what the worker needs — the Position objects themselves stay
         # owned by the GUI thread.
         self._specs = [
@@ -186,7 +287,8 @@ class PositionResolveWorker(QThread):
         for pid, ticker, strike, f_exp, b_exp in self._specs:
             self.statusChanged.emit(f"Resolving {ticker} chain…")
             try:
-                res = resolve_position_legs(api, ticker, strike, f_exp, b_exp)
+                res = resolve_position_legs(api, ticker, strike, f_exp, b_exp,
+                                            cache_ttl=self._chain_ttl)
             except Exception as exc:
                 log.error(f"Position {ticker} chain resolve failed: {exc}")
                 self.positionResolved.emit(pid, '', '', str(exc))
@@ -195,3 +297,32 @@ class PositionResolveWorker(QThread):
                 pid, res['front_streamer_symbol'], res['back_streamer_symbol'], '')
 
         self.resolveFinished.emit()
+
+
+class MarketCalendarWorker(QThread):
+    """Fetches the US equity holiday calendar for the header's status light.
+
+    The indicator is computed locally once a second, so the calendar only has to
+    be fetched occasionally — this runs once at startup and then daily. A failure
+    is not fatal: `market_clock.market_status` degrades to weekends + regular
+    hours when it has no calendar, so the light stays broadly correct offline.
+    """
+
+    calendarReady = Signal(object)      # data_models.MarketCalendar | None
+
+    def __init__(self, session: ApiSession, parent=None):
+        super().__init__(parent)
+        self._session = session
+
+    def run(self):
+        try:
+            sdk = self._session.ensure_sdk()
+        except Exception as exc:
+            log.warning(f"Market calendar: auth not ready ({exc})")
+            self.calendarReady.emit(None)
+            return
+        calendar = sdk.fetch_market_calendar()
+        if calendar:
+            log.info(f"Market calendar: {len(calendar.holidays)} holidays, "
+                     f"{len(calendar.half_days)} half days")
+        self.calendarReady.emit(calendar)

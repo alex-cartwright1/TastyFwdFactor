@@ -1,6 +1,6 @@
 """Qt-native parallel fan-out.
 
-The scan is I/O-bound (HTTP chain requests, yfinance scrapes) and needs a worker
+The scan is I/O-bound (HTTP chain and market-metrics requests) and needs a worker
 pool, but the app has no `concurrent.futures` anywhere — `QThreadPool` /
 `QRunnable` is the Qt equivalent and keeps every thread in the app under one
 model.

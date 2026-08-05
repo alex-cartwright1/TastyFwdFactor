@@ -15,17 +15,20 @@ def update_position_metrics(p: Position, eq: Quote, fq: Quote, bq: Quote,
     """Fold a quote snapshot into `p`. Returns True if anything was updated.
 
     Leg prices are sticky: a quote that arrives with only a bid must not wipe
-    the last known ask, or the P/L would flicker between "priced" and "—".
+    the last known ask, or the P/L would flicker between "priced" and "—". That
+    is what `Quote.has` tests — a field the feed has actually quoted is written
+    whatever its value, so a bid pulled to 0.0 shows as 0.0, while a field the
+    feed has never carried leaves the last known price alone.
     """
     price = eq.price
     if price <= 0:
         return False
 
     p.underlying_price = price
-    if fq.bid > 0: p.f_bid = fq.bid
-    if fq.ask > 0: p.f_ask = fq.ask
-    if bq.bid > 0: p.b_bid = bq.bid
-    if bq.ask > 0: p.b_ask = bq.ask
+    if fq.has('bid'): p.f_bid = fq.bid
+    if fq.has('ask'): p.f_ask = fq.ask
+    if bq.has('bid'): p.b_bid = bq.bid
+    if bq.has('ask'): p.b_ask = bq.ask
 
     if not p.has_full_legs:
         return True

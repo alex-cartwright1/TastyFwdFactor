@@ -5,8 +5,9 @@ the scan runs in a `ScanWorker`, quotes arrive through `LiveFeedController`, and
 every number is computed by `pricing` / `scanner` / `positions`. This class only
 wires those together and translates user actions into calls on them.
 
-Layout is a collapsible left rail (Scanner / Positions / Settings / Logs) driving
-a `QStackedWidget`. Each view carries its own action bar at the top, so the
+Layout is a top status bar (New York clock + market open/closed light) above a
+collapsible left rail (Scanner / Positions / Settings / Logs) driving a
+`QStackedWidget`. Each view carries its own action bar at the top, so the
 controls on screen are always the ones that apply to what's on screen.
 
 The window is constructed with an already-authenticated `ApiSession` handed over
@@ -22,25 +23,30 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QFrame, QHBoxLayout,
+    QAbstractItemView, QButtonGroup, QCheckBox, QCompleter, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QRadioButton, QSizePolicy, QStackedWidget,
     QTableView, QVBoxLayout, QWidget,
 )
 
+from api import QuoteStream
 from applog import LOG_PATH, log
-from charts import PLChartWindow
-from config import KEYRING_AVAILABLE, clear_ticker_cache, load_positions_raw, \
-    load_settings, save_positions_raw
+from charts import PLChartWindow, SetupDetailWindow
+from config import KEYRING_AVAILABLE, clear_chain_cache, clear_ticker_cache, \
+    load_positions_raw, load_settings, save_positions_raw
 from data_models import Position
 from delegates import SignedFlashDelegate, SortHeaderView
 from dialogs import FiltersDialog, PositionDialog
 from live import LiveFeedController
+from market_clock import OPEN, format_nyc, market_status
 from models import SORT_ROLE, PositionsModel, ScanResultsModel
 from positions import update_position_metrics
-from pricing import calc_implied_vol, forward_iv, solve_calendar
-from theme import T, Spinner, make_icon, separator, shadow
-from workers import ApiSession, PositionResolveWorker, ScanWorker
+from pricing import solve_calendar, solve_fills
+from scanner import SCAN_CONSUMER, load_watchlist
+from theme import T, Spinner, StatusDot, make_icon, separator, shadow
+from workers import (
+    ApiSession, MarketCalendarWorker, PositionResolveWorker, ScanWorker,
+)
 
 # Every result row streams. Anything less silently mixes live rows with rows
 # frozen at scan time, which makes sorting by a live column (Fwd Factor above
@@ -51,6 +57,15 @@ LIVE_MAX_ROWS  = 300
 MAX_LOG_LINES  = 5000    # debug pane ring buffer
 RAIL_EXPANDED  = 208
 RAIL_COLLAPSED = 56
+
+# The holiday calendar changes at most once a year, so re-fetching daily is
+# already generous; the open/closed decision itself is recomputed locally every
+# second and costs nothing.
+CALENDAR_REFRESH_MS = 24 * 60 * 60 * 1000
+
+# Column the ticker search filters on.
+_TICKER_COL = next(i for i, c in enumerate(ScanResultsModel.COLUMNS)
+                   if c.header == "Ticker")
 
 
 class NavRail(QWidget):
@@ -185,6 +200,73 @@ def action_bar():
     return bar, layout
 
 
+class MarketStatusBar(QWidget):
+    """Top chrome: the New York wall clock and the market open/closed light.
+
+    Owns the one-second tick itself. The status decision is a pure function of
+    the clock plus a holiday calendar (`market_clock.market_status`), so this
+    never touches the network — the calendar is pushed in from a worker whenever
+    one lands, and until then the light already reads correctly for weekends and
+    regular trading hours.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TopBar")
+        self._calendar = None
+        self._state    = None      # last painted state; guards needless repaints
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 8, 16, 8)
+        row.setSpacing(10)
+
+        self.title = QLabel("TastyFwdFactor")
+        self.title.setObjectName("TopBarTitle")
+        row.addWidget(self.title)
+        row.addStretch(1)
+
+        self.clock = QLabel()
+        self.clock.setObjectName("TopBarClock")
+        row.addWidget(self.clock)
+
+        self.dot = StatusDot(12, T.MARKET_CLOSED, self)
+        row.addWidget(self.dot)
+
+        self.state_label = QLabel()
+        self.state_label.setObjectName("TopBarState")
+        row.addWidget(self.state_label)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+        self._tick()
+
+    def set_calendar(self, calendar):
+        self._calendar = calendar
+        self._state = None         # force a repaint: holidays may change the light
+        self._tick()
+
+    def _tick(self):
+        self.clock.setText(format_nyc())
+
+        state, tooltip = market_status(calendar=self._calendar)
+        if state == self._state:
+            return
+        self._state = state
+
+        is_open = state == OPEN
+        self.dot.set_colour(T.MARKET_OPEN if is_open else T.MARKET_CLOSED)
+        self.state_label.setText("OPEN" if is_open else "CLOSED")
+        self.state_label.setProperty("tone", "open" if is_open else "closed")
+        # A dynamic property only takes effect after a re-polish.
+        self.state_label.style().unpolish(self.state_label)
+        self.state_label.style().polish(self.state_label)
+
+        for widget in (self.dot, self.state_label, self.clock, self):
+            widget.setToolTip(tooltip)
+
+
 class MainWindow(QMainWindow):
 
     signOutRequested = Signal()
@@ -197,8 +279,13 @@ class MainWindow(QMainWindow):
 
         self.settings = load_settings()
         self.session  = session
+        # Must be set before anything triggers `ensure()`, since the TTL decides
+        # what the on-disk chain cache seeds at construction.
+        self.session.set_chain_ttl(self._chain_cache_ttl_secs())
         self._scan_worker    = None
         self._resolve_worker = None
+        self._calendar_worker = None
+        self._scan_targets   = None    # symbols of the in-flight targeted search
         self._chart_windows  = []      # keep references alive; Qt won't
         self._live_iv_method = self.settings.get('iv_method', 'Midpoint')
         self._signing_out    = False
@@ -208,8 +295,13 @@ class MainWindow(QMainWindow):
         self.positions_model.set_rows(
             [Position.from_dict(d) for d in load_positions_raw()])
 
-        self.results_feed = LiveFeedController(self.session, "results", parent=self)
-        self.positions_feed = LiveFeedController(self.session, "positions", parent=self)
+        # One DXLink connection for the whole app: the scan's Phase 3, the
+        # results table and the positions table are all consumers of it, so the
+        # handshake happens once per session and a finished scan hands its
+        # already-streaming symbols straight to the table.
+        self.quote_stream = QuoteStream(self.session, parent=self)
+        self.results_feed = LiveFeedController(self.quote_stream, "results", parent=self)
+        self.positions_feed = LiveFeedController(self.quote_stream, "positions", parent=self)
 
         self._build_ui()
         self._connect_signals()
@@ -226,11 +318,29 @@ class MainWindow(QMainWindow):
         if self.positions_model.rows:
             QTimer.singleShot(600, self._kick_positions_live)
 
+        # Same reasoning for the holiday calendar: the light is already painted
+        # from the local clock, so this only ever refines it.
+        self._calendar_timer = QTimer(self)
+        self._calendar_timer.setInterval(CALENDAR_REFRESH_MS)
+        self._calendar_timer.timeout.connect(self._fetch_market_calendar)
+        self._calendar_timer.start()
+        QTimer.singleShot(300, self._fetch_market_calendar)
+
     # ── UI construction ──────────────────────────────────────────────────────
 
     def _build_ui(self):
         central = QWidget()
-        layout = QHBoxLayout(central)
+        shell = QVBoxLayout(central)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        self.status_bar = MarketStatusBar()
+        shell.addWidget(self.status_bar)
+
+        body = QWidget()
+        # A bare QWidget container inherits the sheet's window background, which
+        # is what we want here — but say so rather than relying on it.
+        layout = QHBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -245,8 +355,31 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_logs_view())
         layout.addWidget(self.stack, 1)
 
+        shell.addWidget(body, 1)
+
         self.nav.set_current(0)
         self.setCentralWidget(central)
+
+    # ── Market status ────────────────────────────────────────────────────────
+
+    def _fetch_market_calendar(self):
+        """Refresh the holiday calendar behind the header light.
+
+        Skipped while one is already in flight — a stale calendar is harmless,
+        and the header never blocks on this.
+        """
+        if self._calendar_worker is not None and self._calendar_worker.isRunning():
+            return
+        self._calendar_worker = MarketCalendarWorker(self.session, self)
+        self._calendar_worker.calendarReady.connect(self._on_calendar_ready)
+        self._calendar_worker.start()
+
+    def _on_calendar_ready(self, calendar):
+        if calendar is None:
+            log.debug("Market calendar unavailable — status light using local "
+                      "hours and weekends only")
+            return
+        self.status_bar.set_calendar(calendar)
 
     def _switch_view(self, index):
         self.stack.setCurrentIndex(index)
@@ -268,6 +401,40 @@ class MainWindow(QMainWindow):
     def _build_scanner_view(self):
         page, box, header = self._page(
             "Scanner", "Rank calendar spreads across the watchlist by forward factor")
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("TickerSearch")
+        self.search_edit.setPlaceholderText("Search ticker…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setFixedWidth(190)
+        self.search_edit.setToolTip(
+            "Type to filter the results table.\n"
+            "Press Enter to scan this ticker on demand if it isn't in the table.")
+        # Completer over the configured watchlist, so the symbol you want is one
+        # or two keystrokes away out of ~5,000.
+        completer = QCompleter(self._watchlist_symbols(), self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchStartsWith)
+        completer.setMaxVisibleItems(12)
+        self.search_edit.setCompleter(completer)
+        header.actions.addWidget(self.search_edit)
+
+        # The line edit's own clear button only appears once there is text, and
+        # it is easy to miss that a stale filter is why the table looks empty
+        # after a scan — so the filter also has an explicit control of its own,
+        # paired with the state badge in the action bar below.
+        self.search_clear_btn = QPushButton("Clear")
+        self.search_clear_btn.setProperty("variant", "ghost")
+        self.search_clear_btn.setToolTip(
+            "Clear the ticker filter and show every scanned row")
+        self.search_clear_btn.setEnabled(False)
+        self.search_clear_btn.clicked.connect(self._clear_search_filter)
+        header.actions.addWidget(self.search_clear_btn)
+
+        self.search_btn = QPushButton("Search")
+        self.search_btn.setToolTip("Scan just this ticker, ignoring the filters")
+        self.search_btn.clicked.connect(self._search_ticker)
+        header.actions.addWidget(self.search_btn)
 
         self.filters_btn = QPushButton("Filters")
         self.filters_btn.setIcon(make_icon('settings', T.TEXT_DIM, 16))
@@ -298,6 +465,14 @@ class MainWindow(QMainWindow):
         bar_layout.addWidget(self.progress)
 
         bar_layout.addWidget(separator(vertical=True))
+        # Says whether the table is showing everything or a filtered subset —
+        # the row count alone can't distinguish "the scan found 3" from "the
+        # filter is hiding 300".
+        self.filter_badge = QLabel("No rows")
+        self.filter_badge.setStyleSheet(self._badge_style(T.TEXT_MUTED))
+        bar_layout.addWidget(self.filter_badge)
+
+        bar_layout.addWidget(separator(vertical=True))
         self.live_badge = QLabel("Idle")
         self.live_badge.setStyleSheet(self._badge_style(T.TEXT_MUTED))
         bar_layout.addWidget(self.live_badge)
@@ -315,16 +490,47 @@ class MainWindow(QMainWindow):
         self.results_proxy.setSourceModel(self.results_model)
         self.results_proxy.setSortRole(SORT_ROLE)
         self.results_proxy.setDynamicSortFilter(True)
+        # The search box filters on the Ticker column only. Source row indices
+        # are unchanged by filtering, so the live feed's row keys stay valid and
+        # hidden rows keep streaming — unhiding one shows a current price, not a
+        # stale one.
+        self.results_proxy.setFilterKeyColumn(_TICKER_COL)
+        self.results_proxy.setFilterCaseSensitivity(
+            Qt.CaseSensitivity.CaseInsensitive)
         self.live_resort.toggled.connect(self.results_proxy.setDynamicSortFilter)
 
         self.results_view = self._make_table(self.results_proxy, self.results_model)
         fwd_col = next(i for i, c in enumerate(ScanResultsModel.COLUMNS)
                        if c.header == "Fwd Factor")
         self.results_view.sortByColumn(fwd_col, Qt.SortOrder.DescendingOrder)
-        box.addWidget(self.results_view, 1)
+        self.results_view.doubleClicked.connect(self._open_setup_detail)
+
+        # The table and its empty state swap places rather than overlaying, so a
+        # "nothing here" message can never be painted on top of live rows.
+        self.results_stack = QStackedWidget()
+        self.results_stack.addWidget(self.results_view)
+        self.results_empty = QLabel()
+        self.results_empty.setObjectName("EmptyState")
+        self.results_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.results_empty.setWordWrap(True)
+        self.results_stack.addWidget(self.results_empty)
+        box.addWidget(self.results_stack, 1)
 
         box.addWidget(self._build_trade_panel())
         return page
+
+    def _chain_cache_ttl_secs(self):
+        return max(int(self.settings.get('chain_cache_ttl_days', 7)), 0) * 86400
+
+    def _watchlist_symbols(self):
+        """Symbols for the search completer. A failed read is not worth blocking
+        the window for — the box still accepts free text."""
+        try:
+            symbols, _ = load_watchlist(self.settings['csv_path'])
+            return sorted(set(symbols))
+        except Exception as exc:
+            log.debug(f"Completer watchlist load failed: {exc}")
+            return []
 
     @staticmethod
     def _badge_style(colour, background=None):
@@ -493,8 +699,9 @@ class MainWindow(QMainWindow):
 
         card, layout = self._settings_card(
             "TICKER DATA CACHE",
-            "Earnings, market cap and ex-dividend dates scraped from yfinance "
-            "are cached on disk. Clearing forces a full re-scrape on the next scan.")
+            "Earnings, market cap and ex-dividend dates from Tastytrade market "
+            "metrics are cached on disk. Clearing forces a full refetch on the "
+            "next scan.")
         clear_btn = QPushButton("Clear ticker cache")
         clear_btn.clicked.connect(self._clear_cache)
         layout.addWidget(clear_btn, 0, Qt.AlignmentFlag.AlignLeft)
@@ -598,6 +805,16 @@ class MainWindow(QMainWindow):
 
         self.results_view.selectionModel().selectionChanged.connect(
             self._on_result_selected)
+        self.search_edit.textChanged.connect(self._on_search_text)
+        self.search_edit.returnPressed.connect(self._search_submit)
+        # Keep the empty state honest when rows appear or vanish for any reason
+        # — a scan finishing, a merge, or the filter changing.
+        self.results_proxy.rowsInserted.connect(
+            lambda *_: self._update_results_empty_state())
+        self.results_proxy.rowsRemoved.connect(
+            lambda *_: self._update_results_empty_state())
+        self.results_proxy.modelReset.connect(
+            lambda: self._update_results_empty_state())
         self.back_paid_edit.textEdited.connect(self._on_leg_edited)
         self.front_credit_edit.textEdited.connect(self._on_leg_edited)
         self.net_debit_edit.textEdited.connect(self._on_net_debit_edited)
@@ -634,15 +851,28 @@ class MainWindow(QMainWindow):
         dialog = FiltersDialog(self.settings, self)
         if dialog.exec():
             self.settings = dialog.settings()
+            self.session.set_chain_ttl(self._chain_cache_ttl_secs())
             self._refresh_settings_summary()
             log.info(f"Filters updated: {self.settings}")
 
     def _clear_cache(self):
+        # The in-memory cache goes first: clearing only the files would leave the
+        # live instance holding the same chains, and its next save would write
+        # them straight back over the files we just deleted.
+        api = self.session.peek()
+        n_chains = api.chains.clear() if api is not None else 0
         clear_ticker_cache()
+        # The chain cache goes with it: the fundamentals refresh is exactly the
+        # event that can invalidate a cached expiration list, and leaving stale
+        # chains behind would undo the point of clearing.
+        clear_chain_cache()
+        log.info(f"Caches cleared: ticker info + {n_chains} option chain(s) "
+                 f"(memory and disk)")
         QMessageBox.information(
             self, "Cache cleared",
-            "Ticker info cache cleared. The next scan will re-scrape earnings, "
-            "dividends and market caps for all tickers.")
+            f"Ticker info cache cleared, along with {n_chains} cached option "
+            f"chain(s). The next scan will refetch earnings, dividends, market "
+            f"caps and chains for all tickers.")
 
     def _sign_out(self):
         confirm = QMessageBox.question(
@@ -665,15 +895,35 @@ class MainWindow(QMainWindow):
             return
         self._start_scan()
 
-    def _start_scan(self):
+    def _start_scan(self, only_tickers=None):
         self._live_iv_method = self.settings.get('iv_method', 'Midpoint')
+        self._scan_targets   = list(only_tickers) if only_tickers else None
 
-        # Tear down the previous stream before the table is rebuilt.
+        # Tear down the previous stream before the table is rebuilt. A targeted
+        # search keeps the existing rows — its results are merged in, so wiping a
+        # full scan just to look up one symbol would be a bad trade.
         self.results_feed.stop()
-        self.results_model.set_rows([])
+        if not only_tickers:
+            self.results_model.set_rows([])
+            # A full scan shows everything it finds. A filter left over from an
+            # earlier search would hide most of the new results and read as a
+            # scan that found nothing, so it is dropped here rather than left for
+            # the user to notice. `blockSignals` avoids a filter round trip
+            # against the table we are about to clear anyway.
+            if self.search_edit.text():
+                self.search_edit.blockSignals(True)
+                self.search_edit.clear()
+                self.search_edit.blockSignals(False)
+            self.results_proxy.setFilterFixedString('')
         self._set_live_badge("Idle", state=None)
+        self._update_results_empty_state()
 
-        worker = ScanWorker(self.session, self.settings, parent=self)
+        # Warm the connection now rather than at Phase 3: the handshake overlaps
+        # with Phases 1–2 instead of adding to the critical path.
+        self.quote_stream.ensure_started()
+        worker = ScanWorker(self.session, self.settings,
+                            only_tickers=only_tickers,
+                            stream=self.quote_stream, parent=self)
         worker.statusChanged.connect(self.status_label.setText)
         worker.progressChanged.connect(self._set_progress)
         worker.indeterminateChanged.connect(self._set_indeterminate)
@@ -686,7 +936,10 @@ class MainWindow(QMainWindow):
         self.run_btn.setProperty("variant", "danger")
         self._repolish(self.run_btn)
         self.filters_btn.setEnabled(False)
+        self.search_btn.setEnabled(False)
         self.scan_spinner.start()
+        if only_tickers:
+            self.status_label.setText(f"Searching {', '.join(only_tickers)}…")
         worker.start()
 
     def _set_progress(self, value):
@@ -707,23 +960,51 @@ class MainWindow(QMainWindow):
         widget.style().polish(widget)
 
     def _on_scan_thread_done(self):
+        # Release the scan's subscription set. `scanFinished` is emitted from
+        # inside run(), so it — and therefore `_start_results_live` — has already
+        # been delivered by the time this queued signal arrives: the table has
+        # declared what it wants, and this drops only the symbols nothing shows
+        # any more. Doing it here rather than in `_on_scan_finished` also covers
+        # the cancelled and failed paths.
+        self.quote_stream.release_consumer(SCAN_CONSUMER)
         self._scan_worker = None
         self.run_btn.setText("Run Scan")
         self.run_btn.setProperty("variant", "primary")
         self._repolish(self.run_btn)
         self.run_btn.setEnabled(True)
         self.filters_btn.setEnabled(True)
+        self.search_btn.setEnabled(True)
         self.scan_spinner.stop()
         self._set_indeterminate(False)
+        self._update_results_empty_state()
 
     def _on_scan_failed(self, message):
         self.status_label.setText(message)
         self.progress.setValue(0)
         log.warning(f"Scan ended: {message}")
+        # A targeted search that found nothing is an ordinary outcome, not an
+        # error dialog — the empty state carries the reason instead.
+        if self._scan_targets:
+            self.results_empty.setText(
+                f"{message}\n\nTry a different DTE target in Filters, or check "
+                f"the Logs view for the per-phase detail.")
+            self.results_stack.setCurrentWidget(self.results_empty)
 
     def _on_scan_finished(self, results):
         self.progress.setValue(100)
+        targets = self._scan_targets
+
         if not results:
+            if targets:
+                self.status_label.setText(
+                    f"No calendar setups for {', '.join(targets)}.")
+                self.results_empty.setText(
+                    f"No viable calendar setup for {', '.join(targets)} at "
+                    f"{self.settings['front_dte']}/{self.settings['back_dte']} DTE.\n"
+                    f"The chain may lack a matching expiry pair, or neither leg "
+                    f"is quoting a bid.")
+                self.results_stack.setCurrentWidget(self.results_empty)
+                return
             self.status_label.setText("Scan complete — no setups found.")
             QMessageBox.information(
                 self, "No Results",
@@ -731,9 +1012,39 @@ class MainWindow(QMainWindow):
                 "Check the Logs view for per-ticker rejection reasons.")
             return
 
-        self.results_model.set_rows(results)
-        self.status_label.setText(f"Scan complete — {len(results)} setup(s) found.")
-        self._start_results_live(results)
+        if targets:
+            rows = self._merge_results(results, targets)
+            # The search leaves the ticker filter on, so say so — otherwise the
+            # merged row count and the visible row count disagree with no
+            # explanation on screen.
+            filtered = self.search_edit.text().strip()
+            suffix = (f" Filter “{filtered}” is on — press Clear to see all "
+                      f"{len(rows)}." if filtered else "")
+            self.status_label.setText(
+                f"{len(results)} setup(s) for {', '.join(targets)} — "
+                f"{len(rows)} row(s) in the table.{suffix}")
+        else:
+            rows = list(results)
+            self.results_model.set_rows(rows)
+            self.status_label.setText(
+                f"Scan complete — {len(rows)} setup(s) found.")
+
+        self._update_results_empty_state()
+        self._start_results_live(rows)
+
+    def _merge_results(self, results, targets):
+        """Fold targeted results into the table, replacing that ticker's rows.
+
+        The whole row list is then re-streamed: `_start_results_live` rebuilds
+        the symbol map from scratch, so the merged rows and the pre-existing ones
+        end up on one feed rather than two half-live tables.
+        """
+        replaced = {t.upper() for t in targets}
+        kept = [r for r in self.results_model.rows if r.ticker not in replaced]
+        rows = kept + list(results)
+        rows.sort(key=lambda r: r.fwd_factor, reverse=True)
+        self.results_model.set_rows(rows)
+        return rows
 
     # ── Results live stream ──────────────────────────────────────────────────
 
@@ -781,10 +1092,14 @@ class MainWindow(QMainWindow):
             eq = feed.quote(r.ticker)
             price = eq.price if eq.price > 0 else r.price
             fq, bq = feed.quote(r.front_sym), feed.quote(r.back_sym)
-            f_bid = fq.bid or r.f_bid
-            f_ask = fq.ask or r.f_ask
-            b_bid = bq.bid or r.b_bid
-            b_ask = bq.ask or r.b_ask
+            # `has(field)` rather than a truthiness test: a leg whose bid is
+            # pulled quotes a real 0.0, and `or r.f_bid` pinned that cell to the
+            # scan-time number for the rest of the session. Fall back only while
+            # the field has genuinely never been quoted.
+            f_bid = fq.bid if fq.has('bid') else r.f_bid
+            f_ask = fq.ask if fq.has('ask') else r.f_ask
+            b_bid = bq.bid if bq.has('bid') else r.b_bid
+            b_ask = bq.ask if bq.has('ask') else r.b_ask
 
             # A None solve still updates the quote columns; the metrics simply
             # hold their previous values.
@@ -793,7 +1108,121 @@ class MainWindow(QMainWindow):
             self.results_model.apply_live_update(
                 row, price, f_bid, f_ask, b_bid, b_ask, ivs)
 
+    # ── Ticker search ────────────────────────────────────────────────────────
+
+    def _on_search_text(self, text):
+        """Uppercase as you type, then filter the table live.
+
+        Filtering is free — the rows are already in the model — so it happens on
+        every keystroke; the on-demand scan is reserved for Enter / the button.
+        """
+        upper = text.upper()
+        if upper != text:
+            pos = self.search_edit.cursorPosition()
+            self.search_edit.setText(upper)     # re-enters once, then upper == text
+            self.search_edit.setCursorPosition(pos)
+            return
+        self._apply_ticker_filter(upper)
+
+    def _apply_ticker_filter(self, symbol):
+        # A fixed string, not a pattern: a ticker like BRK.B contains regex
+        # metacharacters and would otherwise match the wrong rows.
+        self.results_proxy.setFilterFixedString(symbol)
+        self._update_results_empty_state(symbol)
+
+    def _clear_search_filter(self):
+        """Clear button: drop the filter and show the whole table again."""
+        if self.search_edit.text():
+            self.search_edit.clear()        # textChanged re-applies an empty filter
+        else:
+            self._apply_ticker_filter('')
+
+    def _update_filter_badge(self, symbol=None):
+        """Report whether the proxy filter is hiding anything."""
+        symbol = (self.search_edit.text() if symbol is None else symbol).strip().upper()
+        total  = self.results_model.rowCount()
+        shown  = self.results_proxy.rowCount()
+        self.search_clear_btn.setEnabled(bool(symbol))
+        if symbol:
+            self.filter_badge.setText(f"Filtered: {symbol} — {shown} of {total}")
+            self.filter_badge.setStyleSheet(
+                self._badge_style(T.ACCENT, "rgba(76,141,255,0.12)"))
+            self.filter_badge.setToolTip(
+                f"Showing only rows for {symbol}. Press Clear to show all "
+                f"{total} row(s).")
+        else:
+            self.filter_badge.setText(f"All rows ({total})" if total else "No rows")
+            self.filter_badge.setStyleSheet(self._badge_style(T.TEXT_MUTED))
+            self.filter_badge.setToolTip("No ticker filter — every scanned row is shown.")
+
+    def _update_results_empty_state(self, symbol=None):
+        """Swap between the table and the empty-state message."""
+        symbol = self.search_edit.text().strip() if symbol is None else symbol
+        self._update_filter_badge(symbol)
+        if self.results_proxy.rowCount() > 0:
+            self.results_stack.setCurrentWidget(self.results_view)
+            return
+
+        if self.results_model.rowCount() == 0:
+            message = ("No scan results yet.\n"
+                       "Run a scan, or search a ticker to look at just that symbol.")
+        elif symbol:
+            message = (f"No rows for “{symbol}” in the current results.\n"
+                       f"Press Enter to scan {symbol} on demand.")
+        else:
+            message = "No results."
+        self.results_empty.setText(message)
+        self.results_stack.setCurrentWidget(self.results_empty)
+
+    def _search_submit(self):
+        """Enter in the search box: show what we already have, and only go to the
+        network when we have nothing for this ticker."""
+        symbol = self.search_edit.text().strip().upper()
+        if not symbol:
+            self._apply_ticker_filter('')
+            return
+        self._apply_ticker_filter(symbol)
+        if self.results_proxy.rowCount() > 0:
+            self.status_label.setText(
+                f"{self.results_proxy.rowCount()} row(s) for {symbol} from the "
+                f"last scan — press Search to refresh from the market.")
+            return
+        self._search_ticker()
+
+    def _search_ticker(self):
+        """Search button: always run a targeted scan for the typed symbol."""
+        symbol = self.search_edit.text().strip().upper()
+        if not symbol:
+            self.search_edit.setFocus()
+            return
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            QMessageBox.information(
+                self, "Scan in progress",
+                "A scan is already running. Cancel it before searching a ticker.")
+            return
+        self._apply_ticker_filter(symbol)
+        self._start_scan(only_tickers=[symbol])
+
     # ── Trade analysis panel ─────────────────────────────────────────────────
+
+    def _open_setup_detail(self, index):
+        """Double-click a row: open the interactive fill/P-L window for it."""
+        if not index.isValid():
+            return
+        source = self.results_proxy.mapToSource(index)
+        result = self.results_model.row_at(source.row())
+        if result is None:
+            return
+        try:
+            window = SetupDetailWindow(result, parent=self)
+        except Exception as exc:
+            log.error(f"Failed to open setup detail for {result.ticker}: {exc}")
+            QMessageBox.critical(self, "Setup detail",
+                                 f"Could not open this setup: {exc}")
+            return
+        self._chart_windows.append(window)     # keep the reference alive
+        window.show()
+        window.raise_()
 
     def _selected_result(self):
         indexes = self.results_view.selectionModel().selectedRows()
@@ -855,24 +1284,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Input", "Both prices must be positive.")
             return
 
-        t1 = r.front_dte / 365.0
-        t2 = r.back_dte / 365.0
-        f_iv = calc_implied_vol(front_credit, r.price, r.strike, t1)
-        b_iv = calc_implied_vol(back_price,   r.price, r.strike, t2)
-        fwd = forward_iv(f_iv, b_iv, t1, t2)
-        if fwd is None:
+        ivs = solve_fills(r.price, r.strike, r.front_dte, r.back_dte,
+                          front_credit, back_price)
+        if ivs is None:
             self.real_fwd_label.setText("Cannot compute — negative forward variance")
             self.real_fwd_label.setStyleSheet(
                 f"color: {T.NEGATIVE}; font-weight: 600;")
             return
 
-        ff = (f_iv - fwd) / fwd
         self.real_fwd_label.setStyleSheet(
-            f"color: {T.POSITIVE if ff >= 0 else T.NEGATIVE}; font-weight: 600;")
+            f"color: {T.POSITIVE if ivs.fwd_factor >= 0 else T.NEGATIVE}; "
+            f"font-weight: 600;")
         self.real_fwd_label.setText(
-            f"Real fwd factor {ff * 100:+.2f}%   "
-            f"(F {f_iv * 100:.1f}%  ·  B {b_iv * 100:.1f}%  ·  "
-            f"Fwd {fwd * 100:.1f}%)")
+            f"Real fwd factor {ivs.fwd_factor * 100:+.2f}%   "
+            f"(F {ivs.front_iv * 100:.1f}%  ·  B {ivs.back_iv * 100:.1f}%  ·  "
+            f"Fwd {ivs.fwd_iv * 100:.1f}%)")
 
         # Chart with the back IV solved from the actual fill, so the reference
         # line reflects what the trader would be paying.
@@ -880,7 +1306,7 @@ class MainWindow(QMainWindow):
             ticker=r.ticker, price=r.price, strike=r.strike,
             front_dte=r.front_dte, back_dte=r.back_dte,
             back_paid=back_price, front_credit=front_credit,
-            current_back_iv=b_iv, fwd_iv=fwd)
+            current_back_iv=ivs.back_iv, fwd_iv=ivs.fwd_iv)
 
     def _open_chart(self, **kwargs):
         try:
@@ -1007,7 +1433,9 @@ class MainWindow(QMainWindow):
         if unresolved:
             if self._resolve_worker is not None and self._resolve_worker.isRunning():
                 return
-            worker = PositionResolveWorker(self.session, unresolved, parent=self)
+            worker = PositionResolveWorker(
+                self.session, unresolved,
+                chain_ttl=self._chain_cache_ttl_secs(), parent=self)
             worker.statusChanged.connect(self.pos_status.setText)
             worker.positionResolved.connect(self._on_position_resolved)
             worker.resolveFinished.connect(self._subscribe_positions)
@@ -1102,8 +1530,16 @@ class MainWindow(QMainWindow):
             self._scan_worker.wait(3000)
         if self._resolve_worker is not None and self._resolve_worker.isRunning():
             self._resolve_worker.wait(3000)
+        if self._calendar_worker is not None and self._calendar_worker.isRunning():
+            self._calendar_worker.wait(3000)
         self.results_feed.stop()
         self.positions_feed.stop()
+        # The controllers only release their symbols — the socket belongs to the
+        # shared stream, and its QThread would otherwise sit in run_forever() and
+        # keep the process alive.
+        self.quote_stream.stop()
+        # Same for the SDK's event-loop thread.
+        self.session.reset()
 
     def closeEvent(self, event):
         self.shutdown()

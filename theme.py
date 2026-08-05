@@ -47,6 +47,11 @@ class T:
     NEGATIVE    = "#ff6b6b"
     WARNING     = "#e3b341"
 
+    # Market-status light. Deliberately *not* POSITIVE/NEGATIVE: those two are
+    # reserved for signed money, and a green header dot must not read as profit.
+    MARKET_OPEN   = "#28a745"
+    MARKET_CLOSED = "#dc3545"
+
     # Flash overlay for live cell updates.
     FLASH_UP    = QColor(63, 208, 127)
     FLASH_DOWN  = QColor(255, 107, 107)
@@ -105,10 +110,46 @@ def stylesheet():
         background-color: {T.SURFACE};
         border-right: 1px solid {T.BORDER_SOFT};
     }}
+    #TopBar {{
+        background-color: {T.SURFACE};
+        border-bottom: 1px solid {T.BORDER_SOFT};
+    }}
+    #TopBarTitle {{
+        color: {T.TEXT};
+        font-weight: 700;
+        letter-spacing: 0.4px;
+    }}
+    /* Monospaced so the seconds digit ticking doesn't shuffle the whole row. */
+    #TopBarClock {{
+        color: {T.TEXT_DIM};
+        font-family: {T.MONO};
+    }}
+    #TopBarState {{
+        font-weight: 700;
+        font-size: {T.FONT_SIZE - 1}pt;
+        letter-spacing: 0.6px;
+    }}
+    #TopBarState[tone="open"]   {{ color: {T.MARKET_OPEN}; }}
+    #TopBarState[tone="closed"] {{ color: {T.MARKET_CLOSED}; }}
     #Card, #ActionBar {{
         background-color: {T.SURFACE};
         border: 1px solid {T.BORDER_SOFT};
         border-radius: {T.RADIUS}px;
+    }}
+    /* Tickers are short and all-caps — monospace keeps them from jittering as
+       the completer rewrites the field. */
+    #TickerSearch {{
+        font-family: {T.MONO};
+        letter-spacing: 0.5px;
+    }}
+    #EmptyState {{
+        background-color: {T.SURFACE};
+        border: 1px solid {T.BORDER_SOFT};
+        border-radius: {T.RADIUS}px;
+        color: {T.TEXT_MUTED};
+        font-size: {T.FONT_SIZE + 1}pt;
+        line-height: 150%;
+        padding: 40px;
     }}
     #ActionBar {{
         border-radius: {T.RADIUS}px;
@@ -562,4 +603,46 @@ class Spinner(QWidget):
         painter.setPen(arc)
         # Qt angles are in 1/16th of a degree, counter-clockwise.
         painter.drawArc(rect, -self._angle * 16, 100 * 16)
+        painter.end()
+
+
+class StatusDot(QWidget):
+    """A filled indicator circle with a soft halo, painted rather than styled.
+
+    A stylesheet `border-radius` circle would sit on an opaque `QWidget`
+    background and punch a window-coloured square out of the header panel, so
+    this paints itself on a transparent widget instead.
+    """
+
+    def __init__(self, size=12, colour=T.MARKET_CLOSED, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self._colour = QColor(colour)
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def sizeHint(self):
+        return QSize(self._size, self._size)
+
+    def set_colour(self, colour):
+        colour = QColor(colour)
+        if colour != self._colour:
+            self._colour = colour
+            self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        # Halo first, so the dot reads as lit rather than printed.
+        halo = QColor(self._colour)
+        halo.setAlpha(60)
+        painter.setBrush(halo)
+        painter.drawEllipse(QRectF(0, 0, self._size, self._size))
+
+        inset = self._size * 0.26
+        painter.setBrush(self._colour)
+        painter.drawEllipse(QRectF(inset / 2, inset / 2,
+                                   self._size - inset, self._size - inset))
         painter.end()

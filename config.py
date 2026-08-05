@@ -1,9 +1,10 @@
 """Persistent user state.
 
 Everything lives in ``~/.config/calendar-spread/``: ``settings.json`` (scan
-params/filters), ``ticker_info.json`` (yfinance cache), ``positions.json``, and
-— only when no OS keyring backend is available — a mode-600 ``credentials.json``
-fallback.
+params/filters), ``ticker_info.json`` (Tastytrade market-metrics cache),
+``chain_cache.bin`` (option chains — binary, see :func:`save_chain_cache`),
+``positions.json``, and — only when no OS keyring backend is available — a
+mode-600 ``credentials.json`` fallback.
 
 When adding a setting, extend ``DEFAULT_SETTINGS``: ``load_settings()`` merges
 the defaults over the saved file, so older files stay loadable.
@@ -125,6 +126,15 @@ DEFAULT_SETTINGS = {
     'filter_back_dividend':    False,
     'filter_unknown_earnings': False,
     'ticker_info_ttl_days':    7,
+    # Option chains are cached on disk (see api.ChainCache) and survive a
+    # restart, so the TTL is in days like the fundamentals cache above rather
+    # than the minutes it used when the cache died with the process.
+    'chain_cache_ttl_days':    7,
+    # Phase 2 fan-out. The chain fetch is pure network wait, so the useful worker
+    # count is set by the API's rate limiter rather than by the CPU. Clamped to
+    # CHAIN_WORKERS_MAX in scanner.py; api.HTTP_POOL_SIZE must stay >= that, or
+    # the extra workers just queue on the connection pool.
+    'chain_fetch_workers':     35,
 }
 
 IV_METHODS = ("Midpoint", "Bid Front / Ask Back", "Provided Data")
@@ -195,6 +205,84 @@ def clear_ticker_cache():
             log.info(f"Cleared ticker cache: {_TICKER_CACHE_PATH}")
     except Exception as exc:
         log.warning(f"Could not clear ticker cache: {exc}")
+
+
+# ─── Option chain cache (binary, see api.ChainCache) ─────────────────────────
+
+# Not JSON. `api.ChainCache` already holds each chain as a zlib blob, so the file
+# stores those bytes verbatim: no decompress-on-save, no recompress-on-load, and
+# no base64 inflating a 6 MB cache by a third. Layout is a magic line, a decimal
+# header length, a JSON index, then the blobs back to back in index order.
+_CHAIN_CACHE_PATH  = CONFIG_DIR / "chain_cache.bin"
+_CHAIN_CACHE_MAGIC = b"TFFCHAIN1\n"
+
+
+def load_chain_cache():
+    """Return ``{symbol: {'blob': bytes, 'fetched_at': float}}``, or {} on any
+    problem — a cache that won't load is a slow scan, never a failed one."""
+    try:
+        if not _CHAIN_CACHE_PATH.exists():
+            return {}
+        with open(_CHAIN_CACHE_PATH, 'rb') as fh:
+            if fh.read(len(_CHAIN_CACHE_MAGIC)) != _CHAIN_CACHE_MAGIC:
+                log.warning("Chain cache file has an unrecognised format — ignoring")
+                return {}
+            index = json.loads(fh.read(int(fh.readline())))
+            out = {}
+            for rec in index:
+                blob = fh.read(rec['n'])
+                if len(blob) != rec['n']:
+                    # Truncated (killed mid-write on an older build). Keep what
+                    # read cleanly rather than discarding the whole file.
+                    log.warning(f"Chain cache truncated after {len(out)} entries")
+                    break
+                out[rec['s']] = {'blob': blob, 'fetched_at': rec['t']}
+        return out
+    except Exception as exc:
+        log.warning(f"Could not read chain cache: {exc}")
+        return {}
+
+
+def save_chain_cache(entries):
+    """Write ``{symbol: {'blob': bytes, 'fetched_at': float}}`` atomically."""
+    try:
+        _CHAIN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        items  = list(entries.items())          # one snapshot: the index and the
+        index  = [{'s': sym, 't': e['fetched_at'], 'n': len(e['blob'])}
+                  for sym, e in items]          # blobs must stay in step
+        header = json.dumps(index).encode('utf-8')
+        tmp    = _CHAIN_CACHE_PATH.with_suffix('.tmp')
+        try:
+            with open(tmp, 'wb') as fh:
+                fh.write(_CHAIN_CACHE_MAGIC)
+                fh.write(f"{len(header)}\n".encode('utf-8'))
+                fh.write(header)
+                for _, e in items:
+                    fh.write(e['blob'])
+            # Atomic: a crash mid-write leaves the previous cache intact rather
+            # than a half-file the next launch has to detect and discard.
+            os.replace(tmp, _CHAIN_CACHE_PATH)
+        except Exception:
+            # Don't leave a partial .tmp behind for the next save to trip over.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        total = sum(len(e['blob']) for _, e in items)
+        log.info(f"Chain cache saved: {len(items)} chains, "
+                 f"{total / 1e6:.1f} MB → {_CHAIN_CACHE_PATH}")
+    except Exception as exc:
+        log.warning(f"Could not save chain cache: {exc}")
+
+
+def clear_chain_cache():
+    try:
+        if _CHAIN_CACHE_PATH.exists():
+            _CHAIN_CACHE_PATH.unlink()
+            log.info(f"Cleared chain cache: {_CHAIN_CACHE_PATH}")
+    except Exception as exc:
+        log.warning(f"Could not clear chain cache: {exc}")
 
 
 def parse_iso_date(s):

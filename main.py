@@ -6,7 +6,8 @@ Entry point. Everything else lives in:
     config.py       settings / credentials / caches on disk
     data_models.py  Quote, ChainInfo, ScanResult, Position
     pricing.py      Black-Scholes, IV solving, forward factor, P/L curves
-    api.py          Tastytrade REST + DXLink (one-shot and streaming)
+    api.py          Tastytrade REST + SDK reference data + DXLink streaming
+    market_clock.py New York clock and US equity market open/closed status
     scanner.py      the scan pipeline
     positions.py    position P/L bookkeeping
     qtpool.py       QThreadPool fan-out

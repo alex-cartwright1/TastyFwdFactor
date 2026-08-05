@@ -4,198 +4,125 @@ The legacy app carried two near-identical copies of this logic (`_live_*` and
 `_pos_*`), so a fix to one had to be mirrored in the other. Here there is one
 implementation, instantiated twice with different row keys.
 
-Everything in this class runs on the GUI thread: `DXLinkLiveClient.quotesUpdated`
-is a queued signal, so the quote cache needs no locking. Updates are coalesced —
+What this class does *not* own any more is the socket. There is one
+`api.QuoteStream` for the whole app — shared with the scan pipeline — and each
+controller is simply a named consumer of it, declaring which symbols it wants and
+mapping them onto its table's row keys. Connecting, reconnecting and the quote
+cache all live in the stream; `stop()` here releases this table's symbols and
+leaves the connection up for everyone else.
+
+Everything in this class runs on the GUI thread: `QuoteStream.quotesUpdated` is
+delivered there, so the row bookkeeping needs no locking. Updates are coalesced —
 each burst of quotes marks row keys dirty and (re)arms a single-shot timer, so a
 50-row stream produces one repaint per `flush_ms` instead of one per tick.
-
-The controller also owns reconnection. A dropped socket surfaces either as
-`connectionFailed` or as a bare `disconnected`, and both are treated as a drop:
-the dead client is released and a fresh one (with a fresh quote token) is built
-after a backoff. Only `stop()` makes the feed stay down.
 """
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from api import DXLinkLiveClient
 from applog import log
 from data_models import Quote
 
-FLUSH_MS = 750
-
-# A dropped socket used to be terminal: the client was torn down, nothing
-# rebuilt it, and the table quietly showed scan-time prices forever. Retries
-# back off exponentially from RECONNECT_MS to RECONNECT_MAX_MS and then keep
-# trying at that ceiling — a feed that stays down through a network blip is a
-# worse failure than a reconnect loop, and the status badge shows what's going on.
-RECONNECT_MS     = 2_000
-RECONNECT_MAX_MS = 30_000
+# Coalescing window for quote-driven repaints. 750 ms made a moving market look
+# a step behind on the tape; 250 ms still folds a burst of ticks into one
+# repaint, and the flash fade (models.FLASH_TICK_MS, 100 ms) is the finer timer
+# on the GUI thread either way.
+FLUSH_MS = 250
 
 
 class LiveFeedController(QObject):
-    """Owns one persistent DXLink connection and the fan-out to row keys."""
+    """Maps one table's rows onto the shared quote stream."""
 
     rowsDirty      = Signal(set)   # keys whose inputs changed since the last flush
     statusChanged  = Signal(str)
     connected      = Signal()
     failed         = Signal(str)
 
-    def __init__(self, session, name="live", flush_ms=FLUSH_MS, parent=None):
+    def __init__(self, stream, name="live", flush_ms=FLUSH_MS, parent=None):
         super().__init__(parent)
-        self._session = session
+        self._stream  = stream
         self._name    = name
-        self._client  = None
-        self._quotes  = {}      # symbol -> Quote
         self._sym_map = {}      # symbol -> set(row key)
         self._equity  = set()
         self._dirty   = set()
-
-        # True whenever the feed is deliberately idle, so a teardown we asked for
-        # is never mistaken for a drop worth reconnecting.
-        self._stopped  = True
-        self._retry_ms = RECONNECT_MS
+        self._active  = False
 
         self._flush = QTimer(self)
         self._flush.setSingleShot(True)
         self._flush.setInterval(flush_ms)
         self._flush.timeout.connect(self._emit_dirty)
 
-        self._retry = QTimer(self)
-        self._retry.setSingleShot(True)
-        self._retry.timeout.connect(self._reconnect)
+        stream.quotesUpdated.connect(self._on_quotes)
+        stream.statusChanged.connect(self._on_status)
+        stream.connected.connect(self._on_connected)
+        stream.failed.connect(self._on_failed)
 
     # ── state ──
 
     @property
     def is_connected(self):
-        return self._client is not None
+        return self._active and self._stream.is_ready
 
     def quote(self, symbol) -> Quote:
-        return self._quotes.get(symbol, Quote())
+        """Latest merged quote. Served from the stream's store, which is the one
+        cache in the app — the scan reads the same object."""
+        return self._stream.quote(symbol)
+
+    def has_quote(self, symbol, field=None) -> bool:
+        """Whether a live value has been seen for `symbol` (optionally for one
+        field). A row uses this to decide that a 0.0 bid is the market speaking
+        rather than "nothing has arrived yet"."""
+        q = self._stream.quote(symbol)
+        return q.has(field) if field else bool(q.provided)
 
     # ── lifecycle ──
 
     def start(self, sym_map, equity_syms):
-        """Connect (if needed) and subscribe. `sym_map` maps streamer symbol ->
-        set of row keys it feeds; symbols in `equity_syms` also get Trade events.
+        """Subscribe. `sym_map` maps streamer symbol -> set of row keys it feeds;
+        symbols in `equity_syms` also get Trade events.
 
-        Safe to call repeatedly — an existing connection is reused and only the
-        new symbols are subscribed.
+        Safe to call repeatedly — the stream diffs this set against what is
+        already on the wire and sends only the delta.
         """
         self._sym_map = dict(sym_map)
         self._equity  = set(equity_syms)
         if not self._sym_map:
             return
-
-        self._stopped  = False
-        self._retry_ms = RECONNECT_MS
-        self._retry.stop()
-
-        if self._client is not None:
-            self._subscribe()
-            return
-
-        self._connect("Connecting live stream…")
-
-    def _connect(self, status):
-        """Build a fresh client. Always a new one — `DXLinkLiveClient` fetches its
-        own (short-lived) quote token in `run()`, so reconnecting this way picks up
-        a valid token rather than replaying the expired one."""
-        api = self._session.peek()
-        if api is None:
-            self.failed.emit("not authenticated")
-            self._schedule_reconnect("not authenticated")
-            return
-
-        self.statusChanged.emit(status)
-        client = DXLinkLiveClient(api, parent=self)
-        client.quotesUpdated.connect(self._on_quotes)
-        client.ready.connect(self._on_ready)
-        client.connectionFailed.connect(self._on_failed)
-        # Bound method, not a lambda: a functor with no context object would be a
-        # DirectConnection and run this on the WebSocket thread.
-        client.disconnected.connect(self._on_disconnected)
-        self._client = client
-        client.start()
+        self._active = True
+        self._stream.set_consumer(self._name, set(self._sym_map), self._equity)
 
     def stop(self):
-        self._stopped  = True
-        self._retry_ms = RECONNECT_MS
-        self._retry.stop()
-        client, self._client = self._client, None
+        """Release this table's symbols.
+
+        Deliberately does not touch the connection: the other table and the next
+        scan are on it. Only `QuoteStream.stop()` takes the feed down.
+        """
+        self._active  = False
         self._sym_map = {}
         self._dirty.clear()
         self._flush.stop()
-        self._quotes.clear()
-        if client is not None:
-            try:
-                client.stop()
-            except Exception as exc:
-                log.warning(f"Error closing {self._name} live client: {exc}")
-            client.deleteLater()
+        self._stream.release_consumer(self._name)
         self.statusChanged.emit("No live connection")
 
-    # ── client callbacks (GUI thread) ──
+    # ── stream callbacks (GUI thread) ──
 
-    def _on_ready(self):
-        self._retry_ms = RECONNECT_MS   # the connection held; start over on backoff
-        self._subscribe()
-        self.connected.emit()
-        self.statusChanged.emit(
-            f"Live: {len(self._sym_map)} symbol(s) streaming")
+    def _on_status(self, message):
+        if self._active:
+            self.statusChanged.emit(message)
+
+    def _on_connected(self):
+        if self._active:
+            self.connected.emit()
 
     def _on_failed(self, message):
-        log.error(f"{self._name} live stream failed: {message}")
-        self._teardown_client()
-        self.failed.emit(message)
-        self.statusChanged.emit(f"Live: {message}")
-        self._schedule_reconnect(message)
-
-    def _on_disconnected(self):
-        """`run()` returned without an error ever reaching `_on_failed` — a socket
-        that closed cleanly under us. Without this the feed would sit there looking
-        connected while no quotes arrived."""
-        if self._stopped or self._client is None:
-            return          # deliberate stop, or _on_failed already handled it
-        if self.sender() is not self._client:
-            return          # a superseded client finishing late
-        log.warning(f"{self._name} live stream disconnected")
-        self._teardown_client()
-        self.failed.emit("disconnected")
-        self._schedule_reconnect("disconnected")
-
-    def _teardown_client(self):
-        client, self._client = self._client, None
-        if client is not None:
-            # run_forever has already returned; just release the thread object so
-            # a later start() isn't stacking dead clients under this parent.
-            client.stop(wait_ms=1000)
-            client.deleteLater()
-
-    def _schedule_reconnect(self, reason):
-        if self._stopped or not self._sym_map or self._retry.isActive():
-            return
-        delay, self._retry_ms = self._retry_ms, min(self._retry_ms * 2,
-                                                    RECONNECT_MAX_MS)
-        log.info(f"{self._name} live stream reconnecting in {delay} ms ({reason})")
-        self.statusChanged.emit(
-            f"Live: {reason} — reconnecting in {round(delay / 1000)}s")
-        self._retry.start(delay)
-
-    def _reconnect(self):
-        if self._stopped or not self._sym_map or self._client is not None:
-            return
-        self._connect("Reconnecting live stream…")
-
-    def _subscribe(self):
-        if self._client is None:
-            return
-        self._client.subscribe(list(self._sym_map), with_trade_for=self._equity)
+        if self._active:
+            log.error(f"{self._name} live stream: {message}")
+            self.failed.emit(message)
 
     def _on_quotes(self, updates):
+        """One connection feeds every consumer, so a burst carries symbols this
+        table doesn't show; `_sym_map` is what filters it down to our rows."""
         touched = set()
-        for symbol, quote in updates.items():
-            self._quotes.setdefault(symbol, Quote()).merge(quote)
+        for symbol in updates:
             touched |= self._sym_map.get(symbol, set())
         if not touched:
             return

@@ -14,12 +14,30 @@ from typing import Optional, List, Dict, Any
 
 # ─── Quotes ──────────────────────────────────────────────────────────────────
 
+_QUOTE_FIELDS = ('bid', 'ask', 'last')
+
+
 @dataclass
 class Quote:
-    """Latest bid/ask/last for one streamer symbol. 0.0 means 'not yet seen'."""
+    """Latest bid/ask/last for one streamer symbol.
+
+    `provided` names the fields this quote has actually carried — on a feed
+    update, the fields the event supplied a real number for; on a stored quote,
+    every field ever supplied for that symbol. It exists because 0.0 is a
+    legitimate value: an option whose bid is pulled quotes 0 x 0.05, and the old
+    "merge non-zero fields only" rule left the previous bid on screen forever.
+    DXLink also sends NaN for "no value", so the decoder marks a field provided
+    only when the value parses (see `api._quote_float`) — a NaN leaves the
+    previous number alone, a real 0.0 replaces it.
+
+    An empty `provided` means "infer", which is what a `Quote` built by hand
+    outside the feed decoder means, so existing call sites keep their old
+    semantics.
+    """
     bid:  float = 0.0
     ask:  float = 0.0
     last: float = 0.0
+    provided: frozenset = frozenset()
 
     @property
     def mid(self) -> float:
@@ -30,11 +48,71 @@ class Quote:
         """Best available underlying price: last trade, else the mid."""
         return self.last if self.last > 0 else self.mid
 
+    def has(self, name: str) -> bool:
+        """True once a live value has been seen for `name` — what lets a reader
+        tell "bid is 0 because nobody is bidding" from "bid was never quoted"."""
+        return name in self.provided
+
     def merge(self, other: "Quote") -> None:
-        """Apply non-zero fields of `other` on top of this quote in place."""
-        if other.bid  > 0: self.bid  = other.bid
-        if other.ask  > 0: self.ask  = other.ask
-        if other.last > 0: self.last = other.last
+        """Apply the fields `other` carries on top of this quote, in place.
+
+        A carried field is written **whatever its value**, so a bid dropping to
+        0.0 or a new spread replaces the old numbers instead of being ignored.
+        """
+        names = other.provided or frozenset(
+            n for n in _QUOTE_FIELDS if getattr(other, n) > 0)
+        for name in names:
+            setattr(self, name, getattr(other, name))
+        # Accumulate: a stored quote's `provided` is every field ever seen for
+        # that symbol, which is what readers test before trusting a 0.0.
+        self.provided = self.provided | names
+
+
+# ─── Reference data (Tastytrade /market-metrics, /market-time) ───────────────
+
+@dataclass
+class TickerInfo:
+    """Per-symbol reference data used by the scan's pre/post filters.
+
+    Sourced from the Tastytrade SDK's `market-metrics` endpoint. The fields are
+    deliberately the three the filters actually consume — the endpoint returns
+    far more, but persisting only these keeps `ticker_info.json` compatible with
+    files written before the yfinance → Tastytrade migration.
+    """
+    earnings:   Optional[date]  = None
+    market_cap: Optional[float] = None
+    ex_div:     Optional[date]  = None
+
+    @classmethod
+    def from_metric(cls, metric, today: date) -> "TickerInfo":
+        """Map one `tastytrade.metrics.MarketMetricInfo` onto this carrier.
+
+        Everything is coerced out of `Decimal` and pydantic models here, at the
+        boundary, so nothing downstream — least of all `SORT_ROLE` — ever sees a
+        non-native numeric type.
+        """
+        def _future(value):
+            """Tastytrade reports the *last* ex-div as well as the next one; a
+            past date is not a filterable event, so drop it."""
+            return value if isinstance(value, date) and value >= today else None
+
+        earnings = getattr(metric, 'earnings', None)
+        cap      = getattr(metric, 'market_cap', None)
+        return cls(
+            earnings   = _future(getattr(earnings, 'expected_report_date', None)),
+            market_cap = float(cap) if cap is not None else None,
+            # dividend_next_date is the forward-looking field; dividend_ex_date
+            # is usually the most recent one, so it is only a fallback.
+            ex_div     = (_future(getattr(metric, 'dividend_next_date', None))
+                          or _future(getattr(metric, 'dividend_ex_date', None))),
+        )
+
+
+@dataclass
+class MarketCalendar:
+    """US equity market holidays and half days, as published by Tastytrade."""
+    holidays:  List[date] = field(default_factory=list)
+    half_days: List[date] = field(default_factory=list)
 
 
 # ─── Option chain ────────────────────────────────────────────────────────────
