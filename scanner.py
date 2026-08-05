@@ -17,6 +17,12 @@ The phase ordering is a cost optimisation and must not be reordered:
 3. Equity quotes via DXLink → pick the ATM strike → option quotes via DXLink.
 4. Metrics.
 
+Phase 3 subscribes on the app's **persistent** `api.QuoteStream` rather than
+opening its own sockets: it adds symbols to the live connection as it identifies
+them and blocks on the shared `QuoteStore` until they price. Nothing is torn down
+at the end, so the results table is already streaming the moment it is painted.
+`fetch_quotes_with_retry` remains as the fallback for when no stream is available.
+
 `run_scan(..., only_tickers=[...])` runs the same pipeline over an explicit
 symbol list with every user filter disabled — that is the single-ticker search.
 """
@@ -25,7 +31,9 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from api import describe_diags, fetch_quotes_with_retry
+from api import (
+    QUOTE_COVERAGE, QUOTE_QUIET_SECS, describe_diags, fetch_quotes_with_retry,
+)
 from applog import log
 from config import load_ticker_cache, parse_iso_date, save_ticker_cache
 from data_models import ChainInfo, Quote, ScanResult, TickerInfo
@@ -33,6 +41,18 @@ from pricing import solve_calendar
 from qtpool import parallel_map
 
 FALLBACK_TICKERS = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'IWM', 'AMD']
+
+# Phase 2 fan-out ceiling. Chain fetches are pure network wait, so the useful
+# worker count is bounded by the API's rate limiter, not by cores — but it must
+# not exceed `api.HTTP_POOL_SIZE`, or the surplus workers queue on the shared
+# `requests` connection pool and buy nothing.
+CHAIN_WORKERS_DEFAULT = 35
+CHAIN_WORKERS_MAX     = 50
+
+# The consumer name Phase 3 registers on the shared stream. `MainWindow` releases
+# it once the results table has declared its own set, so nothing the scan
+# subscribed outlives the scan.
+SCAN_CONSUMER = "scan"
 
 
 class ScanAborted(Exception):
@@ -111,7 +131,10 @@ def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
     if to_fetch:
         log.info(f"Ticker info: {n_cached} from cache, {len(to_fetch)} to fetch")
     else:
-        log.info(f"Ticker info: all {n_cached} from cache")
+        # Nothing went to the network, so nothing in `cache` changed. Rewriting
+        # ticker_info.json here would serialise thousands of untouched entries on
+        # every warm scan for no effect at all.
+        log.info(f"Ticker info: all {n_cached} from cache — no disk write needed")
         if progress_cb:
             progress_cb(len(symbols), len(symbols))
         return out
@@ -128,7 +151,7 @@ def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
     cancelled = bool(should_cancel and should_cancel())
     if on_refreshed and not cancelled:
         on_refreshed(to_fetch)
-    n_unknown = 0
+    n_unknown = n_written = 0
     for sym in to_fetch:
         info = fetched.get(sym)
         if info is None:
@@ -145,11 +168,18 @@ def fetch_ticker_info(sdk, symbols, progress_cb=None, ttl_days=7,
             'ex_div':     info.ex_div.isoformat() if info.ex_div else None,
             'fetched_at': fetched_at,
         }
+        n_written += 1
 
     if n_unknown:
         log.info(f"Ticker info: {n_unknown}/{len(to_fetch)} symbols unknown to "
                  f"/market-metrics")
-    save_ticker_cache(cache)
+    # Only write when the sweep actually produced entries. A cancelled sweep can
+    # reach here having recorded none, and rewriting the whole file to change
+    # nothing is the most expensive no-op in the pipeline.
+    if n_written:
+        save_ticker_cache(cache)
+    else:
+        log.info("Ticker info: nothing new recorded — cache left untouched")
     return out
 
 
@@ -318,8 +348,46 @@ def calculate_calendar_metrics(chain: ChainInfo, option_quotes, iv_method):
 
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 
-def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
+def _stream_quotes(stream, api, subscribe, trade_syms, wait_for, predicate,
+                   timeout, label):
+    """Price `wait_for` on the persistent stream, falling back to a one-shot fetch.
+
+    `subscribe` is the scan's **cumulative** symbol set — Phase 3b passes 3a's
+    equities along with the option legs, so the underlying prices keep ticking
+    while the legs are being priced, and the results table inherits both.
+
+    Blocks on the shared store until `QuoteStore.wait_for`'s coverage or
+    quiet-period condition is met. Nothing is closed afterwards.
+
+    Returns ``(quotes, diags)``. `diags` is empty on the streaming path; it only
+    carries content when the fallback ran, which is what `describe_diags` reads.
+    """
+    if stream is not None:
+        stream.ensure_started()
+    if stream is None or not stream.wait_ready():
+        log.warning(f"{label}: persistent quote stream unavailable — falling "
+                    f"back to a one-shot DXLink fetch")
+        return fetch_quotes_with_retry(api, list(wait_for), timeout=timeout)
+
+    stream.set_consumer(SCAN_CONSUMER, subscribe, trade_syms)
+
+    wanted  = list(wait_for)
+    started = time.monotonic()
+    priced  = stream.store.wait_for(wanted, predicate, timeout)
+    log.info(f"{label}: {priced}/{len(wanted)} priced in "
+             f"{time.monotonic() - started:.1f}s "
+             f"(coverage target {QUOTE_COVERAGE:.0%}, "
+             f"quiet period {QUOTE_QUIET_SECS}s, timeout {timeout}s)")
+    return stream.store.snapshot(wanted), []
+
+
+def run_scan(api, sdk, settings, reporter=None, only_tickers=None, stream=None):
     """Execute the full scan. Returns a list of ScanResult sorted by fwd factor.
+
+    `stream` is the app's `api.QuoteStream`. Phase 3 subscribes on it instead of
+    opening its own sockets and leaves the subscription in place, so the results
+    table inherits a feed that is already warm. Passing None (or a stream that
+    never becomes ready) falls back to the one-shot batched fetch.
 
     `only_tickers` runs the same pipeline over an explicit symbol list instead of
     the watchlist CSV, which is how the single-ticker search works. In that mode
@@ -345,7 +413,13 @@ def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
     iv_method = settings['iv_method']
     min_price = float(settings['min_price'])
     ttl_days  = int(settings.get('ticker_info_ttl_days', 7))
-    chain_ttl = max(int(settings.get('chain_cache_ttl_min', 30)), 0) * 60
+    chain_ttl = max(int(settings.get('chain_cache_ttl_days', 7)), 0) * 86400
+    try:
+        chain_workers = int(settings.get('chain_fetch_workers',
+                                         CHAIN_WORKERS_DEFAULT))
+    except (TypeError, ValueError):
+        chain_workers = CHAIN_WORKERS_DEFAULT
+    chain_workers = max(1, min(chain_workers, CHAIN_WORKERS_MAX))
 
     filter_f_earn  = settings['filter_front_earnings']
     filter_b_earn  = settings['filter_back_earnings']
@@ -445,7 +519,8 @@ def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
     rep.status(f"Phase 2/4: Fetching option chains ({len(survivors)} tickers)…")
     rep.progress(20)
     log.info(f"Phase 2: chain fetch for {len(survivors)} survivors  "
-             f"front_dte={f_dte}±{f_flex}  back_dte={b_dte}±{b_flex}")
+             f"front_dte={f_dte}±{f_flex}  back_dte={b_dte}±{b_flex}  "
+             f"workers={chain_workers}")
 
     def _fetch_chain(sym):
         return get_chain_info(sym, api, f_dte, b_dte, f_flex, b_flex,
@@ -456,7 +531,7 @@ def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
             rep.progress(20 + int(done / tot * 30))
 
     chains, skip_reasons = {}, {}
-    for sym, chain in parallel_map(_fetch_chain, survivors, max_workers=10,
+    for sym, chain in parallel_map(_fetch_chain, survivors, max_workers=chain_workers,
                                    progress_cb=_cp, should_cancel=rep.cancelled):
         if isinstance(chain, Exception):
             chain = ChainInfo(sym, skip_reason=f'exception:{chain}')
@@ -468,6 +543,19 @@ def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
 
     check_cancel()
     log.info(f"Phase 2 done: {len(chains)} valid, skips={skip_reasons}")
+    cache_stats = api.chains.stats()
+    log.info(f"Chain cache: {cache_stats}")
+    rate_stats = getattr(api, 'rate', None)
+    if rate_stats is not None:
+        log.info(f"Chain pacing: {rate_stats.stats()}")
+    if cache_stats.get('evictions'):
+        # The cap is the only reason a warm rescan would refetch, so say so
+        # rather than leaving the user to infer it from the phase timing.
+        log.warning(
+            f"Chain cache evicted {cache_stats['evictions']} entries — the "
+            f"{cache_stats['max']}-entry cap is smaller than this sweep "
+            f"({len(survivors)} survivors), so the next scan will refetch the "
+            f"difference. Narrow the pre-filter or raise api.CHAIN_CACHE_MAX.")
     if not chains:
         reasons = ', '.join(f'{k}:{v}' for k, v in sorted(skip_reasons.items()))
         if targeted:
@@ -509,7 +597,15 @@ def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
     rep.indeterminate(True)
     log.info(f"Phase 3a: {len(equity_syms)} equity symbols")
 
-    eq_quotes, eq_diags = fetch_quotes_with_retry(api, equity_syms, timeout=25)
+    eq_quotes, eq_diags = _stream_quotes(
+        stream, api,
+        subscribe  = set(equity_syms),
+        trade_syms = set(equity_syms),
+        wait_for   = equity_syms,
+        predicate  = lambda q: q.price > 0,
+        timeout    = 25,
+        label      = "Phase 3a equity quotes",
+    )
     rep.indeterminate(False)
     check_cancel()
 
@@ -539,15 +635,27 @@ def run_scan(api, sdk, settings, reporter=None, only_tickers=None):
         option_syms.update(s for s in (chain.front_sym, chain.back_sym) if s)
 
     if not option_syms:
-        raise ScanAborted(
-            f"No equity prices from DXLink ({describe_diags(eq_diags)}). See Debug Log.")
+        # eq_diags is only populated by the one-shot fallback; on the streaming
+        # path there is no per-socket diagnostic to quote, just an empty feed.
+        why = describe_diags(eq_diags) if eq_diags else "no quotes arrived on the live stream"
+        raise ScanAborted(f"No equity prices from DXLink ({why}). See Debug Log.")
 
     # ── Phase 3b: option quotes ──────────────────────────────────────────────
     rep.status(f"Phase 3/4: Option quotes ({len(option_syms)} contracts)…")
     rep.indeterminate(True)
     log.info(f"Phase 3b: {len(option_syms)} option symbols")
 
-    opt_quotes, _ = fetch_quotes_with_retry(api, list(option_syms), timeout=30)
+    opt_quotes, _ = _stream_quotes(
+        stream, api,
+        # Cumulative: the equities stay subscribed so the table's Price column is
+        # live the instant it is painted, not one flush behind.
+        subscribe  = set(equity_syms) | option_syms,
+        trade_syms = set(equity_syms),
+        wait_for   = option_syms,
+        predicate  = lambda q: q.bid > 0,
+        timeout    = 30,
+        label      = "Phase 3b option quotes",
+    )
     rep.indeterminate(False)
     check_cancel()
 

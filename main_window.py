@@ -29,10 +29,11 @@ from PySide6.QtWidgets import (
     QTableView, QVBoxLayout, QWidget,
 )
 
+from api import QuoteStream
 from applog import LOG_PATH, log
 from charts import PLChartWindow, SetupDetailWindow
-from config import KEYRING_AVAILABLE, clear_ticker_cache, load_positions_raw, \
-    load_settings, save_positions_raw
+from config import KEYRING_AVAILABLE, clear_chain_cache, clear_ticker_cache, \
+    load_positions_raw, load_settings, save_positions_raw
 from data_models import Position
 from delegates import SignedFlashDelegate, SortHeaderView
 from dialogs import FiltersDialog, PositionDialog
@@ -41,7 +42,7 @@ from market_clock import OPEN, format_nyc, market_status
 from models import SORT_ROLE, PositionsModel, ScanResultsModel
 from positions import update_position_metrics
 from pricing import solve_calendar, solve_fills
-from scanner import load_watchlist
+from scanner import SCAN_CONSUMER, load_watchlist
 from theme import T, Spinner, StatusDot, make_icon, separator, shadow
 from workers import (
     ApiSession, MarketCalendarWorker, PositionResolveWorker, ScanWorker,
@@ -278,6 +279,9 @@ class MainWindow(QMainWindow):
 
         self.settings = load_settings()
         self.session  = session
+        # Must be set before anything triggers `ensure()`, since the TTL decides
+        # what the on-disk chain cache seeds at construction.
+        self.session.set_chain_ttl(self._chain_cache_ttl_secs())
         self._scan_worker    = None
         self._resolve_worker = None
         self._calendar_worker = None
@@ -291,8 +295,13 @@ class MainWindow(QMainWindow):
         self.positions_model.set_rows(
             [Position.from_dict(d) for d in load_positions_raw()])
 
-        self.results_feed = LiveFeedController(self.session, "results", parent=self)
-        self.positions_feed = LiveFeedController(self.session, "positions", parent=self)
+        # One DXLink connection for the whole app: the scan's Phase 3, the
+        # results table and the positions table are all consumers of it, so the
+        # handshake happens once per session and a finished scan hands its
+        # already-streaming symbols straight to the table.
+        self.quote_stream = QuoteStream(self.session, parent=self)
+        self.results_feed = LiveFeedController(self.quote_stream, "results", parent=self)
+        self.positions_feed = LiveFeedController(self.quote_stream, "positions", parent=self)
 
         self._build_ui()
         self._connect_signals()
@@ -491,7 +500,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _chain_cache_ttl_secs(self):
-        return max(int(self.settings.get('chain_cache_ttl_min', 30)), 0) * 60
+        return max(int(self.settings.get('chain_cache_ttl_days', 7)), 0) * 86400
 
     def _watchlist_symbols(self):
         """Symbols for the search completer. A failed read is not worth blocking
@@ -822,11 +831,13 @@ class MainWindow(QMainWindow):
         dialog = FiltersDialog(self.settings, self)
         if dialog.exec():
             self.settings = dialog.settings()
+            self.session.set_chain_ttl(self._chain_cache_ttl_secs())
             self._refresh_settings_summary()
             log.info(f"Filters updated: {self.settings}")
 
     def _clear_cache(self):
         clear_ticker_cache()
+        clear_chain_cache()
         # The chain cache goes with it: the fundamentals refresh is exactly the
         # event that can invalidate a cached expiration list, and leaving stale
         # chains behind would undo the point of clearing.
@@ -873,8 +884,12 @@ class MainWindow(QMainWindow):
         self._set_live_badge("Idle", state=None)
         self._update_results_empty_state()
 
+        # Warm the connection now rather than at Phase 3: the handshake overlaps
+        # with Phases 1–2 instead of adding to the critical path.
+        self.quote_stream.ensure_started()
         worker = ScanWorker(self.session, self.settings,
-                            only_tickers=only_tickers, parent=self)
+                            only_tickers=only_tickers,
+                            stream=self.quote_stream, parent=self)
         worker.statusChanged.connect(self.status_label.setText)
         worker.progressChanged.connect(self._set_progress)
         worker.indeterminateChanged.connect(self._set_indeterminate)
@@ -911,6 +926,13 @@ class MainWindow(QMainWindow):
         widget.style().polish(widget)
 
     def _on_scan_thread_done(self):
+        # Release the scan's subscription set. `scanFinished` is emitted from
+        # inside run(), so it — and therefore `_start_results_live` — has already
+        # been delivered by the time this queued signal arrives: the table has
+        # declared what it wants, and this drops only the symbols nothing shows
+        # any more. Doing it here rather than in `_on_scan_finished` also covers
+        # the cancelled and failed paths.
+        self.quote_stream.release_consumer(SCAN_CONSUMER)
         self._scan_worker = None
         self.run_btn.setText("Run Scan")
         self.run_btn.setProperty("variant", "primary")
@@ -1442,8 +1464,11 @@ class MainWindow(QMainWindow):
             self._calendar_worker.wait(3000)
         self.results_feed.stop()
         self.positions_feed.stop()
-        # Stops the SDK's event-loop thread, which would otherwise sit in
-        # run_forever() and keep the process alive.
+        # The controllers only release their symbols — the socket belongs to the
+        # shared stream, and its QThread would otherwise sit in run_forever() and
+        # keep the process alive.
+        self.quote_stream.stop()
+        # Same for the SDK's event-loop thread.
         self.session.reset()
 
     def closeEvent(self, event):

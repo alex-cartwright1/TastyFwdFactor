@@ -31,6 +31,14 @@ class ApiSession(QObject):
         self._mutex  = QMutex()
         self._secret = ''
         self._refresh = ''
+        # Chain-cache TTL in seconds, needed at TastytradeAPI construction so the
+        # on-disk cache can be seeded (and expired entries dropped) up front.
+        self._chain_ttl = 0
+
+    def set_chain_ttl(self, seconds):
+        with QMutexLocker(self._mutex):
+            self._chain_ttl = max(int(seconds), 0)
+        return self
 
     def set_credentials(self, client_secret, refresh_token):
         with QMutexLocker(self._mutex):
@@ -56,7 +64,8 @@ class ApiSession(QObject):
                 return self._api
             if not (self._secret and self._refresh):
                 raise RuntimeError("Tastytrade OAuth credentials are not set")
-            self._api = TastytradeAPI(self._secret, self._refresh)
+            self._api = TastytradeAPI(self._secret, self._refresh,
+                                      chain_ttl_secs=self._chain_ttl)
             return self._api
 
     def ensure_sdk(self) -> MarketDataSession:
@@ -79,7 +88,17 @@ class ApiSession(QObject):
                 log.debug(f"SDK session shutdown: {exc}")
             self._sdk = None
 
+    def save_chain_cache(self):
+        """Persist the option-chain cache if it changed. No-op when nothing has
+        been fetched yet."""
+        api = self.peek()
+        if api is not None:
+            api.save_chains()
+
     def reset(self):
+        # Outside the mutex, and before the instance is dropped — this is the
+        # last chance to keep a session's worth of chain fetches.
+        self.save_chain_cache()
         with QMutexLocker(self._mutex):
             self._api = None
             self._close_sdk_locked()
@@ -141,11 +160,14 @@ class ScanWorker(QThread):
     scanFailed = Signal(str)
 
     def __init__(self, session: ApiSession, settings: dict, only_tickers=None,
-                 parent=None):
+                 stream=None, parent=None):
         super().__init__(parent)
         self._session  = session
         self._settings = dict(settings)
         self._only     = list(only_tickers) if only_tickers else None
+        # The app's shared api.QuoteStream. Phase 3 subscribes on it rather than
+        # opening its own sockets, and leaves the subscription up for the table.
+        self._stream   = stream
         self._cancel_mutex = QMutex()
         self._cancelled = False
 
@@ -180,7 +202,7 @@ class ScanWorker(QThread):
 
         try:
             results = run_scan(api, sdk, self._settings, reporter=self,
-                               only_tickers=self._only)
+                               only_tickers=self._only, stream=self._stream)
         except ScanAborted as exc:
             self.scanFailed.emit(str(exc))
             return
@@ -188,8 +210,17 @@ class ScanWorker(QThread):
             log.error(f"Scan crashed: {exc}")
             self.scanFailed.emit(f"Scan failed: {exc}")
             return
-
-        self.scanFinished.emit(results)
+        else:
+            self.scanFinished.emit(results)
+        finally:
+            # Persist whatever Phase 2 fetched, on this thread rather than the
+            # GUI's — a wide sweep is several MB. In `finally` because a cancelled
+            # or failed scan has usually still fetched thousands of chains, and
+            # throwing them away would mean refetching them all next time.
+            try:
+                api.save_chains()
+            except Exception as exc:
+                log.warning(f"Could not persist chain cache: {exc}")
 
 
 class PositionResolveWorker(QThread):

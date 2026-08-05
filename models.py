@@ -24,7 +24,11 @@ from data_models import Position, ScanResult
 from pricing import fmt_iv, fmt_market_cap, fmt_money, fmt_pct_signed
 
 FLASH_MS      = 900
-FLASH_TICK_MS = 40      # ~25fps, so the delegate can fade the flash out smoothly
+# ~10fps. The tick re-emits dataChanged for every cell with a live flash, so on a
+# busy feed it is competing with the quote flush for the GUI thread; at 25fps a
+# few hundred flashing cells spent more main-thread time repainting the fade than
+# rendering the numbers underneath it. A 900 ms fade still reads as smooth here.
+FLASH_TICK_MS = 100
 
 # Custom roles. The model stays a pure data provider: it publishes *what* a cell
 # is (comparable value, signed-ness, how fresh its last change is) and the

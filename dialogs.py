@@ -128,14 +128,17 @@ class FiltersDialog(QDialog):
         self.ttl_days = self._int_spin(int(settings.get('ticker_info_ttl_days', 7)), 0, 365)
         ttl_form.addRow("Ticker info: refresh after (days, 0 = always):",
                         self.ttl_days)
-        self.chain_ttl_min = self._int_spin(
-            int(settings.get('chain_cache_ttl_min', 30)), 0, 1440)
-        self.chain_ttl_min.setToolTip(
-            "Option chains are cached in memory for this long, so a repeat scan "
-            "or a single-ticker search skips the REST round trip.\n"
-            "0 disables the cache.")
-        ttl_form.addRow("Option chains: keep for (minutes, 0 = off):",
-                        self.chain_ttl_min)
+        self.chain_ttl_days = self._int_spin(
+            int(settings.get('chain_cache_ttl_days', 7)), 0, 90)
+        self.chain_ttl_days.setToolTip(
+            "Option chains are cached on disk and survive a restart, so a repeat "
+            "scan or a single-ticker search skips the REST round trip entirely.\n"
+            "0 disables the cache.\n\n"
+            "Longer is faster but staler: a cached chain won't include "
+            "expirations listed since it was fetched, and if the underlying has "
+            "moved a long way the strike nearest the money may not be in it.")
+        ttl_form.addRow("Option chains: keep for (days, 0 = off):",
+                        self.chain_ttl_days)
         cache_layout.addLayout(ttl_form)
         refresh_btn = QPushButton("Refresh ticker data now (clear cache)")
         refresh_btn.clicked.connect(self._refresh_cache)
@@ -231,7 +234,7 @@ class FiltersDialog(QDialog):
             'filter_back_dividend':    self.b_div.isChecked(),
             'filter_unknown_earnings': self.no_earn.isChecked(),
             'ticker_info_ttl_days':    self.ttl_days.value(),
-            'chain_cache_ttl_min':     self.chain_ttl_min.value(),
+            'chain_cache_ttl_days':    self.chain_ttl_days.value(),
         })
         save_settings(self._settings)
         self.accept()

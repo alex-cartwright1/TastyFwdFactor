@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from scipy.stats import norm
+from scipy.special import ndtr
 
 RISK_FREE_RATE = 0.04
 PER_CONTRACT   = 100     # share multiplier
@@ -23,17 +23,43 @@ DAYS_PER_YEAR  = 365.0
 
 IV_BID_ASK = "Bid Front / Ask Back"
 
+_INV_SQRT2    = 1.0 / math.sqrt(2.0)
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+# ─── Normal distribution ─────────────────────────────────────────────────────
+
+# `scipy.stats.norm.cdf/pdf` are frozen-distribution methods: every call runs
+# argument broadcasting, validation and dtype promotion before it touches the
+# actual erf, which costs ~50x the arithmetic itself. The scan solves two IVs per
+# setup at up to 100 Newton iterations each, so on a few thousand candidates that
+# overhead dominates Phase 4. These are the same functions, evaluated directly.
+#
+# The *vectorized* path keeps SciPy, but as `scipy.special.ndtr` — the raw ufunc
+# under `norm.cdf`, without the frozen-distribution wrapper. `math.erf` takes
+# scalars only, and a Python loop over 300 grid points would be slower than the
+# ufunc it replaced.
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x * _INV_SQRT2))
+
+
+def norm_pdf(x: float) -> float:
+    return _INV_SQRT_2PI * math.exp(-0.5 * x * x)
+
 
 # ─── Black-Scholes ───────────────────────────────────────────────────────────
 
 def bs_price(S, K, T, r, v, option_type='c'):
     if T <= 0 or v <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * v**2) * T) / (v * np.sqrt(T))
-    d2 = d1 - v * np.sqrt(T)
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * v * v) * T) / (v * sqrtT)
+    d2 = d1 - v * sqrtT
+    disc = math.exp(-r * T)
     if option_type == 'c':
-        return float(S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
-    return float(K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1))
+        return S * norm_cdf(d1) - K * disc * norm_cdf(d2)
+    return K * disc * norm_cdf(-d2) - S * norm_cdf(-d1)
 
 
 def bs_call_vec(S_arr, K, T, r, sigma):
@@ -44,33 +70,47 @@ def bs_call_vec(S_arr, K, T, r, sigma):
     sqrtT = math.sqrt(T)
     d1 = (np.log(S_arr / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
     d2 = d1 - sigma * sqrtT
-    return S_arr * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
+    return S_arr * ndtr(d1) - K * math.exp(-r * T) * ndtr(d2)
 
 
 def calc_implied_vol(target_price, S, K, T, r=RISK_FREE_RATE):
     """Newton solve for call IV. Returns >= 0.001 so callers can reject on a
     floor test rather than on None.
 
-    The result is coerced to a plain `float`: `sigma` picks up numpy's dtype from
-    the vega term, and a `np.float64` reaching a Qt model breaks sorting outright
-    — PySide can't convert it to a QVariant double, so `lessThan` ends up
-    comparing opaque objects. It stays a float subclass, so nothing else notices.
+    The result is a plain `float` throughout — no numpy scalar can leak out of
+    here. A `np.float64` reaching a Qt model breaks sorting outright: PySide
+    can't convert it to a QVariant double, so `lessThan` ends up comparing opaque
+    objects, and it stays a `float` subclass so nothing else notices.
+
+    Price and vega share one `d1`: the loop used to call `bs_price` and then
+    recompute the same log/sqrt terms for vega, doubling the transcendental cost
+    of every iteration.
     """
     if target_price <= 0 or S <= 0 or K <= 0 or T <= 0:
         return 0.001
+    sqrtT = math.sqrt(T)
+    log_m = math.log(S / K)
+    disc  = math.exp(-r * T)
     sigma = 0.5
     for _ in range(100):
-        price = bs_price(S, K, T, r, sigma)
-        vega = (S * norm.pdf(
-            (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-        ) * np.sqrt(T))
-        diff = target_price - price
+        v_sqrtT = sigma * sqrtT
+        if v_sqrtT == 0.0:
+            break                       # vega would be 0 — the old loop broke here too
+        d1 = (log_m + (r + 0.5 * sigma * sigma) * T) / v_sqrtT
+        # A Newton overshoot can drive sigma negative. That is not an error state:
+        # the price of a non-positive vol is 0, vega stays positive, and the next
+        # step pulls sigma back up. Bailing out here instead would turn a solvable
+        # leg into a rejected one.
+        price = (S * norm_cdf(d1) - K * disc * norm_cdf(d1 - v_sqrtT)
+                 if sigma > 0 else 0.0)
+        diff  = target_price - price
         if abs(diff) < 1e-5:
-            return float(max(sigma, 0.001))
+            return max(sigma, 0.001)
+        vega = S * norm_pdf(d1) * sqrtT
         if vega < 1e-4:
             break
         sigma += diff / vega
-    return float(max(sigma, 0.001))
+    return max(sigma, 0.001)
 
 
 # ─── Forward factor ──────────────────────────────────────────────────────────
