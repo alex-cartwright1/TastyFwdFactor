@@ -12,11 +12,12 @@ the defaults over the saved file, so older files stay loadable.
 
 import json
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-from applog import log
+from applog import CONFIG_DIR, log
 
 try:
     import keyring
@@ -27,7 +28,15 @@ except Exception:
     KEYRING_AVAILABLE = False
 
 
-CONFIG_DIR = Path.home() / ".config" / "calendar-spread"
+def resource_path(name):
+    """Locate a file shipped *with* the code (``full.csv``), which is not the
+    same place as the user's own state. PyInstaller unpacks bundled data into
+    ``sys._MEIPASS``; a source checkout has it beside this module."""
+    base = getattr(sys, '_MEIPASS', None) or Path(__file__).parent
+    return Path(base) / name
+
+
+DEFAULT_CSV_PATH = resource_path("full.csv")
 
 _KEYRING_SERVICE   = "calendar-spread-tastytrade"
 _LEGACY_CREDS_PATH = CONFIG_DIR / "credentials.json"
@@ -112,7 +121,7 @@ def clear_credentials():
 # ─── Settings ────────────────────────────────────────────────────────────────
 
 DEFAULT_SETTINGS = {
-    'csv_path':                str(Path(__file__).parent / "full.csv"),
+    'csv_path':                str(DEFAULT_CSV_PATH),
     'front_dte':               21,
     'back_dte':                45,
     'front_dte_flex':          0,
@@ -144,7 +153,15 @@ def load_settings():
     try:
         if _SETTINGS_PATH.exists():
             data = json.loads(_SETTINGS_PATH.read_text())
-            return {**DEFAULT_SETTINGS, **data}
+            merged = {**DEFAULT_SETTINGS, **data}
+            # A onefile build unpacks to a *new* temp dir every launch, so a
+            # csv_path saved by an earlier run points at a directory that no
+            # longer exists. Fall back to the bundled copy rather than making
+            # every scan fall back to FALLBACK_TICKERS.
+            csv = merged.get('csv_path') or ''
+            if not os.path.exists(csv):
+                merged['csv_path'] = str(DEFAULT_CSV_PATH)
+            return merged
     except Exception as exc:
         log.warning(f"Could not read settings file: {exc}")
     return dict(DEFAULT_SETTINGS)

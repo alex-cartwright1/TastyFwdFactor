@@ -3,3 +3,5 @@ __pycache__/
 debug.log
 CLAUDE.md
 .venv/
+build/
+dist/

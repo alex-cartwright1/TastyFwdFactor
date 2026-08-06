@@ -237,8 +237,9 @@ Positions are saved automatically to `~/.config/calendar-spread/positions.json` 
 
 | Path | Contents |
 |---|---|
-| `debug.log` | Full debug log for the current session (overwritten on each launch) |
+| `~/.config/calendar-spread/debug.log` | Full debug log for the current session (overwritten on each launch) |
 | `~/.config/calendar-spread/settings.json` | Scan settings and filters |
+| `~/.config/calendar-spread/chain_cache.bin` | Option chain cache (binary) |
 | `~/.config/calendar-spread/ticker_info.json` | Earnings / market cap / dividend cache |
 | `~/.config/calendar-spread/positions.json` | Saved position tracker entries |
 | `~/.config/calendar-spread/credentials.json` | OAuth credentials (only if OS keyring is unavailable; mode 600) |

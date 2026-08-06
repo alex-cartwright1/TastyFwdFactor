@@ -16,6 +16,7 @@ by `LoginWindow`, which is why nothing here asks for credentials.
 
 import os
 import subprocess
+import sys
 
 from PySide6.QtCore import (
     QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QSize,
@@ -840,7 +841,8 @@ class MainWindow(QMainWindow):
             if hasattr(os, 'startfile'):
                 os.startfile(str(LOG_PATH))
             else:
-                subprocess.Popen(['xdg-open', str(LOG_PATH)],
+                opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                subprocess.Popen([opener, str(LOG_PATH)],
                                  stderr=subprocess.DEVNULL)
         except Exception:
             QMessageBox.information(self, "Log File", f"Log location:\n{LOG_PATH}")
